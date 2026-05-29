@@ -1,0 +1,38 @@
+# Network Observability Monitor -- .gitignore
+
+# Runtime data -- never commit these
+data/
+logs/
+
+# Specific file patterns in case directory structure differs
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.log.*
+
+# Incident tracert output files
+incidents/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

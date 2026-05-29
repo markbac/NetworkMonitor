@@ -1,0 +1,112 @@
+general:
+  poll_interval_seconds: 1
+  retention_days: 14        # rows older than this are deleted hourly from all tables
+  timezone: Europe/London
+
+storage:
+  sqlite_db: data/sqlite/network_monitor.db
+
+  event_log:
+    path: logs/network_monitor.log
+    max_size_mb: 25
+    backup_count: 10
+
+  incidents_path: data/incidents/
+
+network:
+  internet_ping_hosts:
+    - 1.1.1.1
+    - 8.8.8.8
+    - teams.microsoft.com
+
+  dns_hosts:
+    - teams.microsoft.com
+    - microsoft.com
+    - google.com
+
+  http_targets:
+    - https://www.microsoft.com
+    - https://teams.microsoft.com
+    - https://www.google.com
+
+wifi:
+  # Set true even on wired-primary machines -- Wi-Fi signal, BSSID, roaming
+  # detection, and environment scans all work when Ethernet is the default
+  # route, provided the Wi-Fi adapter is associated to a network.
+  # Set false only if no Wi-Fi adapter is present.
+  enabled: true
+  roaming_detection: true   # informational; detection always runs when enabled: true
+
+  # How many polling cycles between full environment scans
+  # (netsh wlan show networks mode=bssid). At poll_interval_seconds: 1 this
+  # means one scan per minute. Increase if the scan adds too much to
+  # probe_duration_ms on slower machines.
+  scan_interval_cycles: 60
+
+nic:
+  # 'auto' records every non-loopback NIC with any traffic -- both Ethernet
+  # and Wi-Fi appear simultaneously when both are active. Use an exact psutil
+  # NIC name (e.g. 'Wi-Fi', 'Ethernet') to restrict to one adapter.
+  interface: auto
+
+thresholds:
+  high_latency_ms: 150
+  severe_latency_ms: 500     # supersedes high_latency; triggers fault diagnostics
+  high_jitter_ms: 50
+  slow_dns_ms: 500
+  packet_loss_rate_pct: 5    # rolling loss % above this triggers high_packet_loss
+  nic_error_rate_ps: 1.0     # combined errors+drops/s above this triggers nic_errors
+
+diagnostics:
+  traceroute_on_fault: true
+
+  # slow_probe fires when probe_duration_ms exceeds interval * multiplier.
+  # Default 1.5 avoids noise on machines where probes reliably take slightly
+  # longer than the poll interval (common on VPN-connected machines).
+  slow_probe_multiplier: 1.5
+
+bufferbloat:
+  enabled: true
+
+  # URL of a large file to download during the test. The download runs for
+  # test_duration_seconds regardless of file size; it is abandoned after that.
+  # Cloudflare's speed test endpoint is reliable and geographically distributed.
+  download_url: "https://speed.cloudflare.com/__down?bytes=104857600"
+
+  # Seconds the download runs while pings are fired. Longer = more stable
+  # result but blocks the probe loop for that duration on scan cycles.
+  test_duration_seconds: 10
+
+  # Number of pings fired during the download window.
+  ping_count: 10
+
+  # Polling cycles between bufferbloat scans. At 1 s poll rate:
+  #   300 = every 5 minutes (default)
+  #   600 = every 10 minutes
+  interval_cycles: 300
+
+speedtest:
+  enabled: true
+
+  # Cloudflare speed test endpoints. No account required.
+  # download_url: a large file; the download runs for test_duration_seconds
+  # then is abandoned -- the bytes= parameter just needs to be large enough
+  # not to be exhausted before the test window ends.
+  download_url: "https://speed.cloudflare.com/__down?bytes=104857600"
+  upload_url:   "https://speed.cloudflare.com/__up"
+
+  # Seconds per direction. Total blocking time per test cycle is
+  # approximately 2 * test_duration_seconds.
+  test_duration_seconds: 10
+
+  # Polling cycles between speed tests. At 1 s poll rate:
+  #   900  = every 15 minutes (default)
+  #   1800 = every 30 minutes
+  # Speed tests are skipped if a bufferbloat scan would fire on the same
+  # cycle; the speed test takes priority and bufferbloat is deferred.
+  interval_cycles: 900
+
+tui:
+  enabled: true
+  refresh_rate_ms: 1000      # informational; TUI redraws at ~100 ms
+  max_events: 20
