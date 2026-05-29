@@ -50,10 +50,10 @@ nic:
   interface: auto
 
 thresholds:
-  high_latency_ms: 150
-  severe_latency_ms: 500     # supersedes high_latency; triggers fault diagnostics
+  high_latency_ms: 500
+  severe_latency_ms: 1000     # supersedes high_latency; triggers fault diagnostics
   high_jitter_ms: 50
-  slow_dns_ms: 500
+  slow_dns_ms: 750
   packet_loss_rate_pct: 5    # rolling loss % above this triggers high_packet_loss
   nic_error_rate_ps: 1.0     # combined errors+drops/s above this triggers nic_errors
 
