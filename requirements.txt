@@ -1,0 +1,6 @@
+requests
+psutil
+pyyaml
+flask
+windows-curses; sys_platform == "win32"
+ctxlogkit @ git+https://github.com/markbac/py-logkit

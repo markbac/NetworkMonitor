@@ -65,7 +65,6 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from logging.handlers import RotatingFileHandler
 import logging.handlers
 from pathlib import Path
 from typing import Optional
@@ -73,6 +72,7 @@ from typing import Optional
 import psutil
 import requests
 import yaml
+from ctxlogkit import setup_logging
 
 
 CONFIG_FILE = "config/default.yaml"
@@ -86,6 +86,11 @@ IPCONFIG_ALL_TTL   = 10   # seconds between ipconfig /all re-reads
 # be enabled/disabled without affecting normal event logging.
 debug_log = logging.getLogger("netmon.debug")
 debug_log.setLevel(logging.DEBUG)
+# Keep command traces out of the main event log; they go to their own file.
+debug_log.propagate = False
+
+# Event logger. Configured by Monitor._setup_logging via ctxlogkit.
+log = logging.getLogger("netmon")
 debug_log.propagate = False  # don't send to root handler
 
 
@@ -1362,15 +1367,16 @@ class Monitor:
     def _setup_logging(self):
         log_cfg = self.config["storage"]["event_log"]
         Path(log_cfg["path"]).parent.mkdir(parents=True, exist_ok=True)
-        handler = RotatingFileHandler(
-            log_cfg["path"],
-            maxBytes=log_cfg["max_size_mb"] * 1024 * 1024,
-            backupCount=log_cfg["backup_count"],
-        )
-        logging.basicConfig(
-            level=logging.INFO,
-            handlers=[handler],
-            format="%(asctime)s %(levelname)s %(message)s",
+        # Console output stays off: the curses TUI owns the terminal.
+        setup_logging(
+            name="netmon",
+            level="INFO",
+            to_console=False,
+            to_file=True,
+            file_path=log_cfg["path"],
+            rotation="size",
+            max_bytes=log_cfg["max_size_mb"] * 1024 * 1024,
+            backup_count=log_cfg["backup_count"],
         )
 
     def _add_event(self, category: str, message: str):
@@ -1378,7 +1384,7 @@ class Monitor:
         ts = datetime.now().isoformat()
         display = f"{datetime.now().strftime('%H:%M:%S')} [{category}] {message}"
         self.events.appendleft(display)
-        logging.info("[%s] %s", category, message)
+        log.info("[%s] %s", category, message)
         self.storage.insert_event(ts, category, message)
 
     # -----------------------------------------------------------------------
@@ -1817,7 +1823,7 @@ class Monitor:
                 # Almost always "addstr() returned ERR" when the terminal is
                 # too small. Log at DEBUG and continue; the next cycle will
                 # try again after the user resizes.
-                logging.debug("TUI render error: %s", exc)
+                log.debug("TUI render error: %s", exc)
 
             key = stdscr.getch()
             if key in (ord("q"), ord("Q")):
