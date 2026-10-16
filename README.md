@@ -17,8 +17,10 @@ Provides a terminal TUI and a separate web dashboard.
 ## Installation
 
 ```bash
-pip install requests psutil pyyaml windows-curses flask
+pip install -r requirements.txt
 ```
+
+Logging uses [ctxlogkit](https://github.com/markbac/py-logkit), installed straight from Git (it is not on PyPI), so `git` must be on PATH.
 
 ## File layout
 
