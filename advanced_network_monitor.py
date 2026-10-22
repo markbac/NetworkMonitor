@@ -72,6 +72,7 @@ from typing import Optional
 import psutil
 import requests
 import yaml
+from concurrent.futures import ThreadPoolExecutor
 from ctxlogkit import setup_logging
 
 
@@ -91,7 +92,6 @@ debug_log.propagate = False
 
 # Event logger. Configured by Monitor._setup_logging via ctxlogkit.
 log = logging.getLogger("netmon")
-debug_log.propagate = False  # don't send to root handler
 
 
 class CommandLogger:
@@ -271,6 +271,28 @@ class SpeedTestSample:
     duration_seconds: float
     download_url: str
     upload_url: str
+
+
+@dataclass
+class ProcessSample:
+    """Snapshot of a network-active process (network hog detection)."""
+    timestamp: str
+    pid: int
+    name: str
+    conn_count: int
+    read_bytes_ps: float
+    write_bytes_ps: float
+
+
+@dataclass
+class DnsBenchmarkSample:
+    """Benchmark comparing local DNS against public DNS resolvers."""
+    timestamp: str
+    local_ms: Optional[float]
+    cloudflare_ms: Optional[float]
+    google_ms: Optional[float]
+    quad9_ms: Optional[float]
+    fastest: Optional[str]
 
 
 # ---------------------------------------------------------------------------
@@ -974,27 +996,25 @@ class BufferbloatProbe:
         """
         ts = datetime.now().isoformat()
 
-        # Start background download to saturate the uplink queue.
-        download_done = threading.Event()
+        # Start background download to saturate the link queue during measurements.
+        stop_event = threading.Event()
         bytes_downloaded = [0]
+        test_start = time.monotonic()
 
         def _download():
             try:
                 with requests.get(
                     self.download_url,
                     stream=True,
-                    timeout=self.test_duration + 5,
+                    timeout=self.test_duration + 10,
                 ) as resp:
                     resp.raise_for_status()
-                    deadline = time.monotonic() + self.test_duration
                     for chunk in resp.iter_content(chunk_size=65536):
                         bytes_downloaded[0] += len(chunk)
-                        if time.monotonic() >= deadline:
+                        if stop_event.is_set():
                             break
             except Exception:
                 pass
-            finally:
-                download_done.set()
 
         dl_thread = threading.Thread(target=_download, daemon=True)
         dl_thread.start()
@@ -1012,13 +1032,15 @@ class BufferbloatProbe:
                 loaded_rtts.append(rtt)
             time.sleep(ping_interval)
 
-        # Wait for download to finish (it should already be done).
-        dl_thread.join(timeout=2)
+        # Signal download to stop once all pings are complete.
+        stop_event.set()
+        dl_thread.join(timeout=3)
+        actual_duration = max(1.0, time.monotonic() - test_start)
 
         # Compute results.
         loaded_ms   = round(statistics.mean(loaded_rtts), 1) if loaded_rtts else None
         delta_ms    = round(loaded_ms - baseline_ms, 1) if (loaded_ms and baseline_ms) else None
-        dl_mbps     = round(bytes_downloaded[0] * 8 / 1_000_000 / self.test_duration, 2)
+        dl_mbps     = round(bytes_downloaded[0] * 8 / 1_000_000 / actual_duration, 2)
 
         rating = "unknown"
         if delta_ms is not None:
@@ -1165,23 +1187,125 @@ class SpeedTestProbe:
         return total_bytes[0], mbps
 
 
+
+# ---------------------------------------------------------------------------
+# Process network probe (Network Hogs)
+# ---------------------------------------------------------------------------
+
+class ProcessNetProbe:
+    """Monitors top network-active processes and bandwidth hogs."""
+
+    def __init__(self):
+        self._last_proc_io: dict[int, tuple[float, float, float]] = {}
+
+    def read(self, top_n: int = 8) -> list[ProcessSample]:
+        now = time.monotonic()
+        ts = datetime.now().isoformat()
+        samples: list[ProcessSample] = []
+        current_io: dict[int, tuple[float, float, float]] = {}
+
+        conn_counts: dict[int, int] = {}
+        try:
+            for conn in psutil.net_connections(kind="inet"):
+                if conn.pid and conn.status == "ESTABLISHED":
+                    conn_counts[conn.pid] = conn_counts.get(conn.pid, 0) + 1
+        except Exception:
+            pass
+
+        for p in psutil.process_iter(["pid", "name", "io_counters"]):
+            try:
+                pid = p.info["pid"]
+                if not pid or pid == 0:
+                    continue
+                name = p.info["name"] or f"PID {pid}"
+                io = p.info.get("io_counters")
+                conns = conn_counts.get(pid, 0)
+
+                if io:
+                    current_io[pid] = (float(io.read_bytes), float(io.write_bytes), now)
+                    prev = self._last_proc_io.get(pid)
+                    if prev:
+                        elapsed = max(0.1, now - prev[2])
+                        read_rate = max(0.0, (io.read_bytes - prev[0]) / elapsed)
+                        write_rate = max(0.0, (io.write_bytes - prev[1]) / elapsed)
+                    else:
+                        read_rate = 0.0
+                        write_rate = 0.0
+                else:
+                    read_rate = 0.0
+                    write_rate = 0.0
+
+                if conns > 0 or (read_rate + write_rate > 1024):
+                    samples.append(ProcessSample(
+                        timestamp=ts,
+                        pid=pid,
+                        name=name,
+                        conn_count=conns,
+                        read_bytes_ps=round(read_rate, 1),
+                        write_bytes_ps=round(write_rate, 1),
+                    ))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        self._last_proc_io = current_io
+        samples.sort(
+            key=lambda s: (s.read_bytes_ps + s.write_bytes_ps, s.conn_count),
+            reverse=True,
+        )
+        return samples[:top_n]
+
+
+# ---------------------------------------------------------------------------
+# DNS Benchmark Probe
+# ---------------------------------------------------------------------------
+
+class DnsBenchmarkProbe:
+    """Benchmarks DNS query latency across local DNS and major public resolvers."""
+
+    def run(self, local_dns: Optional[str]) -> DnsBenchmarkSample:
+        ts = datetime.now().isoformat()
+        local_ms = dns_server_latency(local_dns) if local_dns else None
+        cf_ms    = dns_server_latency("1.1.1.1")
+        goog_ms  = dns_server_latency("8.8.8.8")
+        quad_ms  = dns_server_latency("9.9.9.9")
+
+        scores = {}
+        if local_ms is not None: scores["Local DNS"] = local_ms
+        if cf_ms is not None:    scores["Cloudflare"] = cf_ms
+        if goog_ms is not None:  scores["Google"] = goog_ms
+        if quad_ms is not None:  scores["Quad9"] = quad_ms
+
+        fastest = min(scores, key=scores.get) if scores else None
+        return DnsBenchmarkSample(
+            timestamp=ts,
+            local_ms=local_ms,
+            cloudflare_ms=cf_ms,
+            google_ms=goog_ms,
+            quad9_ms=quad_ms,
+            fastest=fastest,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Storage
 # ---------------------------------------------------------------------------
 
 class Storage:
-    """SQLite persistence for all tables.
+    """Thread-safe SQLite persistence for all tables.
 
-    _apply_schema() runs schema.sql via executescript() on construction.
-    check_same_thread=False allows the web dashboard to open a second
-    read-only connection to the same file concurrently.
+    Uses a threading.Lock to serialize transactions, enables WAL mode for
+    high-concurrency read/write, and applies busy timeouts.
     """
 
     def __init__(self, db_path: str):
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._path = db_path
-        self.connection = sqlite3.connect(db_path, check_same_thread=False)
-        self._apply_schema()
+        self._lock = threading.Lock()
+        self.connection = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
+        with self._lock:
+            self.connection.execute("PRAGMA journal_mode = WAL;")
+            self.connection.execute("PRAGMA busy_timeout = 5000;")
+            self._apply_schema()
 
     def _apply_schema(self):
         with open(SCHEMA_FILE, "r", encoding="utf-8") as fh:
@@ -1195,12 +1319,7 @@ class Storage:
             return 0
 
     def purge_old_rows(self, retention_days: int):
-        """Delete rows older than retention_days from all tables.
-
-        Uses a single cutoff timestamp computed once and applied to every
-        table. Commits once after all deletes to keep the operation atomic.
-        Called from the retention thread once per hour.
-        """
+        """Delete rows older than retention_days from all tables."""
         cutoff = (datetime.now() - timedelta(days=retention_days)).isoformat()
         tables = [
             ("samples",             "timestamp"),
@@ -1211,99 +1330,161 @@ class Storage:
             ("wifi_scan_results",   "scan_timestamp"),
             ("bufferbloat_samples", "timestamp"),
             ("speed_test_results",  "timestamp"),
+            ("action_queue",        "timestamp"),
+            ("process_samples",     "timestamp"),
+            ("dns_benchmarks",      "timestamp"),
         ]
-        for table, col in tables:
-            self.connection.execute(
-                f"DELETE FROM {table} WHERE {col} < ?", (cutoff,)
-            )
-        self.connection.commit()
+        with self._lock:
+            for table, col in tables:
+                self.connection.execute(
+                    f"DELETE FROM {table} WHERE {col} < ?", (cutoff,)
+                )
+            self.connection.commit()
 
     def insert_sample(self, s: Sample):
-        self.connection.execute("""
-            INSERT INTO samples
-                (timestamp, probed_host, internet_ping, gateway_ping,
-                 dns_ms, dns_server_ms, http_ms, packet_loss_rate,
-                 ip_address, dns_server, cpu_pct, ram_pct,
-                 probe_duration_ms, notes)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (s.timestamp, s.probed_host, s.internet_ping, s.gateway_ping,
-              s.dns_ms, s.dns_server_ms, s.http_ms, s.packet_loss_rate,
-              s.ip_address, s.dns_server, s.cpu_pct, s.ram_pct,
-              s.probe_duration_ms, s.notes))
-        self.connection.commit()
+        with self._lock:
+            self.connection.execute("""
+                INSERT INTO samples
+                    (timestamp, probed_host, internet_ping, gateway_ping,
+                     dns_ms, dns_server_ms, http_ms, packet_loss_rate,
+                     ip_address, dns_server, cpu_pct, ram_pct,
+                     probe_duration_ms, notes)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (s.timestamp, s.probed_host, s.internet_ping, s.gateway_ping,
+                  s.dns_ms, s.dns_server_ms, s.http_ms, s.packet_loss_rate,
+                  s.ip_address, s.dns_server, s.cpu_pct, s.ram_pct,
+                  s.probe_duration_ms, s.notes))
+            self.connection.commit()
 
     def insert_event(self, timestamp: str, category: str, message: str):
-        self.connection.execute(
-            "INSERT INTO events (timestamp, category, message) VALUES (?,?,?)",
-            (timestamp, category, message),
-        )
-        self.connection.commit()
+        with self._lock:
+            self.connection.execute(
+                "INSERT INTO events (timestamp, category, message) VALUES (?,?,?)",
+                (timestamp, category, message),
+            )
+            self.connection.commit()
 
     def insert_wifi(self, w: WifiSample):
-        self.connection.execute("""
-            INSERT INTO wifi_samples
-                (timestamp, ssid, bssid, signal_pct, channel, band,
-                 rx_rate_mbps, tx_rate_mbps, auth)
-            VALUES (?,?,?,?,?,?,?,?,?)
-        """, (w.timestamp, w.ssid, w.bssid, w.signal_pct, w.channel,
-              w.band, w.rx_rate_mbps, w.tx_rate_mbps, w.auth))
-        self.connection.commit()
+        with self._lock:
+            self.connection.execute("""
+                INSERT INTO wifi_samples
+                    (timestamp, ssid, bssid, signal_pct, channel, band,
+                     rx_rate_mbps, tx_rate_mbps, auth)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (w.timestamp, w.ssid, w.bssid, w.signal_pct, w.channel,
+                  w.band, w.rx_rate_mbps, w.tx_rate_mbps, w.auth))
+            self.connection.commit()
 
     def insert_nic(self, n: NicSample):
-        self.connection.execute("""
-            INSERT INTO nic_samples
-                (timestamp, interface, bytes_sent_ps, bytes_recv_ps,
-                 errin_ps, errout_ps, dropin_ps, dropout_ps)
-            VALUES (?,?,?,?,?,?,?,?)
-        """, (n.timestamp, n.interface, n.bytes_sent_ps, n.bytes_recv_ps,
-              n.errin_ps, n.errout_ps, n.dropin_ps, n.dropout_ps))
-        self.connection.commit()
+        with self._lock:
+            self.connection.execute("""
+                INSERT INTO nic_samples
+                    (timestamp, interface, bytes_sent_ps, bytes_recv_ps,
+                     errin_ps, errout_ps, dropin_ps, dropout_ps)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (n.timestamp, n.interface, n.bytes_sent_ps, n.bytes_recv_ps,
+                  n.errin_ps, n.errout_ps, n.dropin_ps, n.dropout_ps))
+            self.connection.commit()
 
     def insert_tcp(self, t: TcpStateSample):
-        self.connection.execute("""
-            INSERT INTO tcp_states
-                (timestamp, established, time_wait, close_wait, syn_sent,
-                 syn_recv, fin_wait1, fin_wait2, closing, last_ack, listen, other)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (t.timestamp, t.established, t.time_wait, t.close_wait,
-              t.syn_sent, t.syn_recv, t.fin_wait1, t.fin_wait2,
-              t.closing, t.last_ack, t.listen, t.other))
-        self.connection.commit()
+        with self._lock:
+            self.connection.execute("""
+                INSERT INTO tcp_states
+                    (timestamp, established, time_wait, close_wait, syn_sent,
+                     syn_recv, fin_wait1, fin_wait2, closing, last_ack, listen, other)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (t.timestamp, t.established, t.time_wait, t.close_wait,
+                  t.syn_sent, t.syn_recv, t.fin_wait1, t.fin_wait2,
+                  t.closing, t.last_ack, t.listen, t.other))
+            self.connection.commit()
 
     def insert_wifi_scan(self, entries: list[WifiScanEntry]):
-        """Persist all entries from one scan batch. Single commit for the batch."""
-        self.connection.executemany("""
-            INSERT INTO wifi_scan_results
-                (scan_timestamp, ssid, bssid, signal_pct, channel, band,
-                 authentication, cipher)
-            VALUES (?,?,?,?,?,?,?,?)
-        """, [
-            (e.scan_timestamp, e.ssid, e.bssid, e.signal_pct, e.channel,
-             e.band, e.authentication, e.cipher)
-            for e in entries
-        ])
-        self.connection.commit()
+        with self._lock:
+            self.connection.executemany("""
+                INSERT INTO wifi_scan_results
+                    (scan_timestamp, ssid, bssid, signal_pct, channel, band,
+                     authentication, cipher)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, [
+                (e.scan_timestamp, e.ssid, e.bssid, e.signal_pct, e.channel,
+                 e.band, e.authentication, e.cipher)
+                for e in entries
+            ])
+            self.connection.commit()
 
     def insert_bufferbloat(self, b: BufferbloatSample):
-        self.connection.execute("""
-            INSERT INTO bufferbloat_samples
-                (timestamp, baseline_ms, loaded_ms, delta_ms, rating,
-                 download_mbps, ping_host, download_url)
-            VALUES (?,?,?,?,?,?,?,?)
-        """, (b.timestamp, b.baseline_ms, b.loaded_ms, b.delta_ms,
-              b.rating, b.download_mbps, b.ping_host, b.download_url))
-        self.connection.commit()
+        with self._lock:
+            self.connection.execute("""
+                INSERT INTO bufferbloat_samples
+                    (timestamp, baseline_ms, loaded_ms, delta_ms, rating,
+                     download_mbps, ping_host, download_url)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (b.timestamp, b.baseline_ms, b.loaded_ms, b.delta_ms,
+                  b.rating, b.download_mbps, b.ping_host, b.download_url))
+            self.connection.commit()
 
     def insert_speed_test(self, s: SpeedTestSample):
-        self.connection.execute("""
-            INSERT INTO speed_test_results
-                (timestamp, download_mbps, upload_mbps, download_bytes,
-                 upload_bytes, duration_seconds, download_url, upload_url)
-            VALUES (?,?,?,?,?,?,?,?)
-        """, (s.timestamp, s.download_mbps, s.upload_mbps,
-              s.download_bytes, s.upload_bytes, s.duration_seconds,
-              s.download_url, s.upload_url))
-        self.connection.commit()
+        with self._lock:
+            self.connection.execute("""
+                INSERT INTO speed_test_results
+                    (timestamp, download_mbps, upload_mbps, download_bytes,
+                     upload_bytes, duration_seconds, download_url, upload_url)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (s.timestamp, s.download_mbps, s.upload_mbps,
+                  s.download_bytes, s.upload_bytes, s.duration_seconds,
+                  s.download_url, s.upload_url))
+            self.connection.commit()
+
+    def insert_process_samples(self, samples: list[ProcessSample]):
+        with self._lock:
+            self.connection.executemany("""
+                INSERT INTO process_samples
+                    (timestamp, pid, name, conn_count, read_bytes_ps, write_bytes_ps)
+                VALUES (?,?,?,?,?,?)
+            """, [
+                (s.timestamp, s.pid, s.name, s.conn_count, s.read_bytes_ps, s.write_bytes_ps)
+                for s in samples
+            ])
+            self.connection.commit()
+
+    def insert_dns_benchmark(self, b: DnsBenchmarkSample):
+        with self._lock:
+            self.connection.execute("""
+                INSERT INTO dns_benchmarks
+                    (timestamp, local_ms, cloudflare_ms, google_ms, quad9_ms, fastest)
+                VALUES (?,?,?,?,?,?)
+            """, (b.timestamp, b.local_ms, b.cloudflare_ms, b.google_ms, b.quad9_ms, b.fastest))
+            self.connection.commit()
+
+    def poll_pending_action(self) -> Optional[dict]:
+        with self._lock:
+            cur = self.connection.execute(
+                "SELECT id, action, payload FROM action_queue WHERE status = 'pending' ORDER BY id ASC LIMIT 1"
+            )
+            row = cur.fetchone()
+            if row:
+                self.connection.execute(
+                    "UPDATE action_queue SET status = 'running' WHERE id = ?", (row[0],)
+                )
+                self.connection.commit()
+                return {"id": row[0], "action": row[1], "payload": row[2]}
+            return None
+
+    def close(self):
+        """Close the SQLite connection cleanly."""
+        with self._lock:
+            try:
+                self.connection.close()
+            except Exception:
+                pass
+
+    def update_action(self, action_id: int, status: str, result: Optional[str] = None):
+        with self._lock:
+            self.connection.execute(
+                "UPDATE action_queue SET status = ?, result = ? WHERE id = ?",
+                (status, result, action_id),
+            )
+            self.connection.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -1351,14 +1532,28 @@ class Monitor:
         self._setup_logging()
         self._last_loop_time: Optional[float] = None
 
+        # Background worker pool for non-blocking speed tests, bufferbloat, and tracert
+        self._worker_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="netmon_worker")
+        self._speed_test_running = False
+        self._bloat_test_running = False
+        self._tracert_running = False
+        self._last_tracert_time = 0.0
+        self.TRACERT_COOLDOWN_SECONDS = 300  # 5 min cooldown
+
+        # Feature 3: Process network hog probe
+        self.proc_probe = ProcessNetProbe()
+        # Feature 6: DNS benchmark probe
+        self.dns_benchmark_probe = DnsBenchmarkProbe()
+
         # Write startup event after storage is ready.
         self._add_event("system", "monitor_start")
 
     def shutdown(self):
-        """Graceful shutdown -- write stop event before exiting."""
+        """Graceful shutdown -- write stop event and release worker pool."""
         if self.running:
             self.running = False
             self._add_event("system", "monitor_stop")
+            self._worker_pool.shutdown(wait=False)
 
     def _load_config(self) -> dict:
         with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
@@ -1392,8 +1587,7 @@ class Monitor:
     # -----------------------------------------------------------------------
 
     def _ping(self, host: str) -> Optional[float]:
-        """Ping host once (Windows -n 1 -w 1000); return RTT ms or None."""
-        start = time.perf_counter()
+        """Ping host once (Windows -n 1 -w 1000); return actual ICMP RTT ms or None."""
         try:
             result = cmd_logger.run(
                 ["ping", "-n", "1", "-w", "1000", host],
@@ -1401,7 +1595,13 @@ class Monitor:
             )
             if result.returncode != 0:
                 return None
-            return round((time.perf_counter() - start) * 1000, 1)
+            out = result.stdout.decode("utf-8", errors="ignore")
+            m = re.search(r"time[=<](\d+(?:\.\d+)?)ms", out, re.IGNORECASE)
+            if m:
+                return float(m.group(1))
+            if "<1ms" in out or "< 1ms" in out:
+                return 0.5
+            return None
         except Exception:
             return None
 
@@ -1499,32 +1699,182 @@ class Monitor:
     # Fault diagnostics
     # -----------------------------------------------------------------------
 
+    def _trigger_speed_test(self, action_id: Optional[int] = None):
+        if self._speed_test_running:
+            if action_id:
+                self.storage.update_action(action_id, "failed", "Speed test already in progress")
+            return
+        self._speed_test_running = True
+
+        def _task():
+            try:
+                self._add_event("system", "speedtest: started background test")
+                sample = self.speed_probe.run()
+                self.storage.insert_speed_test(sample)
+                msg = f"speedtest: dl={sample.download_mbps} Mbps, ul={sample.upload_mbps} Mbps"
+                self._add_event("system", msg)
+                if action_id:
+                    self.storage.update_action(action_id, "completed", msg)
+            except Exception as exc:
+                self._add_event("system", f"speedtest failed: {exc}")
+                if action_id:
+                    self.storage.update_action(action_id, "failed", str(exc))
+            finally:
+                self._speed_test_running = False
+
+        self._worker_pool.submit(_task)
+
+    def _trigger_bufferbloat(self, action_id: Optional[int] = None):
+        if self._bloat_test_running:
+            if action_id:
+                self.storage.update_action(action_id, "failed", "Bufferbloat test already in progress")
+            return
+        self._bloat_test_running = True
+
+        def _task():
+            try:
+                self._add_event("system", "bufferbloat: started background test")
+                sample = self.bloat_probe.run(
+                    ping_host=self.ping_cycler.all()[0],
+                    baseline_ms=self.stats.average(),
+                    ping_fn=self._ping,
+                )
+                self.storage.insert_bufferbloat(sample)
+                msg = (
+                    f"bufferbloat: {sample.rating} "
+                    f"(baseline={sample.baseline_ms} ms, loaded={sample.loaded_ms} ms, "
+                    f"delta={sample.delta_ms} ms, dl={sample.download_mbps} Mbps)"
+                )
+                self._add_event("system", msg)
+                if action_id:
+                    self.storage.update_action(action_id, "completed", msg)
+            except Exception as exc:
+                self._add_event("system", f"bufferbloat failed: {exc}")
+                if action_id:
+                    self.storage.update_action(action_id, "failed", str(exc))
+            finally:
+                self._bloat_test_running = False
+
+        self._worker_pool.submit(_task)
+
+    def _trigger_wifi_scan(self, action_id: Optional[int] = None):
+        def _task():
+            try:
+                entries = self.wifi_scanner.scan()
+                if entries:
+                    self.storage.insert_wifi_scan(entries)
+                    msg = f"wifi_scan: found {len(entries)} visible networks"
+                    self._add_event("wifi", msg)
+                    if action_id:
+                        self.storage.update_action(action_id, "completed", msg)
+                else:
+                    if action_id:
+                        self.storage.update_action(action_id, "completed", "No networks found")
+            except Exception as exc:
+                if action_id:
+                    self.storage.update_action(action_id, "failed", str(exc))
+
+        self._worker_pool.submit(_task)
+
+    def _trigger_dns_benchmark(self, local_dns: Optional[str], action_id: Optional[int] = None):
+        def _task():
+            try:
+                bench = self.dns_benchmark_probe.run(local_dns)
+                self.storage.insert_dns_benchmark(bench)
+                msg = f"dns_benchmark: fastest={bench.fastest} (CF: {bench.cloudflare_ms}ms, Google: {bench.google_ms}ms, Local: {bench.local_ms}ms)"
+                self._add_event("system", msg)
+                if action_id:
+                    self.storage.update_action(action_id, "completed", msg)
+            except Exception as exc:
+                if action_id:
+                    self.storage.update_action(action_id, "failed", str(exc))
+
+        self._worker_pool.submit(_task)
+
+    def _trigger_manual_traceroute(self, target: str, action_id: Optional[int] = None):
+        def _task():
+            try:
+                self._add_event("info", f"Running manual tracert to {target}")
+                out = cmd_logger.check_output(
+                    ["tracert", target],
+                    text=True, encoding="utf-8", errors="ignore", timeout=60,
+                )
+                inc_dir = Path(self.config["storage"]["incidents_path"])
+                inc_dir.mkdir(parents=True, exist_ok=True)
+                fname = inc_dir / f"incident_{int(time.time())}.txt"
+                with open(fname, "w", encoding="utf-8") as fh:
+                    fh.write(f"Manual traceroute to {target}\n\n{out}")
+                msg = f"traceroute to {target} completed, saved to {fname.name}"
+                self._add_event("info", msg)
+                if action_id:
+                    self.storage.update_action(action_id, "completed", msg)
+            except Exception as exc:
+                self._add_event("info", f"manual tracert failed: {exc}")
+                if action_id:
+                    self.storage.update_action(action_id, "failed", str(exc))
+
+        self._worker_pool.submit(_task)
+
+    def _process_action_queue(self, dns_srv: Optional[str]):
+        item = self.storage.poll_pending_action()
+        if not item:
+            return
+        aid = item["id"]
+        act = item["action"]
+        payload = item.get("payload") or ""
+
+        if act == "speedtest":
+            self._trigger_speed_test(action_id=aid)
+        elif act == "bufferbloat":
+            self._trigger_bufferbloat(action_id=aid)
+        elif act == "wifiscan":
+            self._trigger_wifi_scan(action_id=aid)
+        elif act == "dns_benchmark":
+            self._trigger_dns_benchmark(dns_srv, action_id=aid)
+        elif act == "traceroute":
+            target = payload.strip() if payload.strip() else self.ping_cycler.all()[0]
+            self._trigger_manual_traceroute(target, action_id=aid)
+        else:
+            self.storage.update_action(aid, "failed", f"Unknown action: {act}")
+
     def _fault_diagnostics(self):
-        """Probe all hosts concurrently and run tracert on fault."""
+        """Probe all hosts concurrently and run tracert in background on fault."""
         if not self.config["diagnostics"]["traceroute_on_fault"]:
             return
+        now = time.monotonic()
+        if self._tracert_running or (now - self._last_tracert_time < self.TRACERT_COOLDOWN_SECONDS):
+            return
 
-        all_results = self._ping_all(self.ping_cycler.all())
-        summary = ", ".join(
-            f"{h}={'OK' if ms is not None else 'FAIL'}"
-            for h, ms in all_results.items()
-        )
-        self._add_event("fault", f"multi-host probe: {summary}")
+        self._tracert_running = True
+        self._last_tracert_time = now
 
-        primary = self.ping_cycler.all()[0]
-        self._add_event("info", f"Running tracert to {primary}")
-        try:
-            out = cmd_logger.check_output(
-                ["tracert", primary],
-                text=True, encoding="utf-8", errors="ignore", timeout=60,
-            )
-            inc_dir = Path(self.config["storage"]["incidents_path"])
-            inc_dir.mkdir(parents=True, exist_ok=True)
-            fname = inc_dir / f"incident_{int(time.time())}.txt"
-            with open(fname, "w", encoding="utf-8") as fh:
-                fh.write(f"Multi-host probe: {summary}\n\n{out}")
-        except Exception as exc:
-            self._add_event("info", f"tracert failed: {exc}")
+        def _task():
+            try:
+                all_results = self._ping_all(self.ping_cycler.all())
+                summary = ", ".join(
+                    f"{h}={'OK' if ms is not None else 'FAIL'}"
+                    for h, ms in all_results.items()
+                )
+                self._add_event("fault", f"multi-host probe: {summary}")
+
+                primary = self.ping_cycler.all()[0]
+                self._add_event("info", f"Running tracert to {primary}")
+                out = cmd_logger.check_output(
+                    ["tracert", primary],
+                    text=True, encoding="utf-8", errors="ignore", timeout=60,
+                )
+                inc_dir = Path(self.config["storage"]["incidents_path"])
+                inc_dir.mkdir(parents=True, exist_ok=True)
+                fname = inc_dir / f"incident_{int(time.time())}.txt"
+                with open(fname, "w", encoding="utf-8") as fh:
+                    fh.write(f"Multi-host probe: {summary}\n\n{out}")
+                self._add_event("info", f"tracert saved to {fname.name}")
+            except Exception as exc:
+                self._add_event("info", f"tracert failed: {exc}")
+            finally:
+                self._tracert_running = False
+
+        self._worker_pool.submit(_task)
 
     # -----------------------------------------------------------------------
     # Retention thread
@@ -1586,42 +1936,41 @@ class Monitor:
 
             wifi_sample, wifi_events = self.wifi_probe.read()
 
-            # Run the full environment scan on the first cycle and then every
-            # scan_interval_cycles cycles after that. Running on cycle 1 means
-            # the dashboard shows Wi-Fi scan data immediately on startup rather
-            # than waiting up to a minute.
+            # Process any queued on-demand actions from web UI or CLI
+            self._process_action_queue(dns_srv)
+
+            # Feature 3: Sample network-active processes every 2 cycles
+            if self._cycle_count % 2 == 0:
+                try:
+                    proc_samples = self.proc_probe.read(top_n=8)
+                    if proc_samples:
+                        self.storage.insert_process_samples(proc_samples)
+                except Exception:
+                    pass
+
+            # Feature 6: Multi-DNS benchmark every 60 cycles
+            if self._cycle_count > 0 and self._cycle_count % 60 == 0:
+                self._trigger_dns_benchmark(dns_srv)
+
+            # Wi-Fi full environment scan
             scan_entries: list[WifiScanEntry] = []
             if self._cycle_count == 1 or self._cycle_count % self._scan_interval == 0:
                 scan_entries = self.wifi_scanner.scan()
 
-            # Run bufferbloat test on its own interval. Skipped on cycle 0
-            # so the rolling baseline has time to populate first. Runs inside
-            # the probe block so probe_duration_ms reflects the ~10 s test cost.
-            # Also skipped if a speed test fires this cycle -- they would
-            # interfere by saturating the link simultaneously.
+            # Trigger scheduled speed tests and bufferbloat in background pool
             speed_test_this_cycle = (
                 self.speed_probe.enabled
                 and self._cycle_count > 0
                 and self._cycle_count % self._speed_interval == 0
             )
+            if speed_test_this_cycle:
+                self._trigger_speed_test()
 
-            bloat_sample: Optional[BufferbloatSample] = None
             if (self.bloat_probe.enabled
                     and self._cycle_count > 0
                     and self._cycle_count % self._bloat_interval == 0
                     and not speed_test_this_cycle):
-                bloat_sample = self.bloat_probe.run(
-                    ping_host=self.ping_cycler.all()[0],
-                    baseline_ms=self.stats.average(),
-                    ping_fn=self._ping,
-                )
-
-            # Run speed test -- download then upload, each for test_duration_seconds.
-            # Total blocking time is ~2 * test_duration_seconds; probe_duration_ms
-            # will show this cost. Runs after bufferbloat to avoid link contention.
-            speed_sample: Optional[SpeedTestSample] = None
-            if speed_test_this_cycle:
-                speed_sample = self.speed_probe.run()
+                self._trigger_bufferbloat()
 
             nic_samples = self.nic_probe.read(elapsed_since_last)
             tcp = read_tcp_states()
@@ -1668,30 +2017,13 @@ class Monitor:
 
             if wifi_sample:
                 self.storage.insert_wifi(wifi_sample)
-                self.current_nic = nic_samples[0] if nic_samples else None
+            if nic_samples:
+                self.current_nic = nic_samples[0]
             for ns in nic_samples:
                 self.storage.insert_nic(ns)
             self.storage.insert_tcp(tcp)
             if scan_entries:
                 self.storage.insert_wifi_scan(scan_entries)
-            if bloat_sample:
-                self.storage.insert_bufferbloat(bloat_sample)
-                self._add_event(
-                    "system",
-                    f"bufferbloat: {bloat_sample.rating} "
-                    f"(baseline={bloat_sample.baseline_ms} ms, "
-                    f"loaded={bloat_sample.loaded_ms} ms, "
-                    f"delta={bloat_sample.delta_ms} ms, "
-                    f"dl={bloat_sample.download_mbps} Mbps)",
-                )
-            if speed_sample:
-                self.storage.insert_speed_test(speed_sample)
-                self._add_event(
-                    "system",
-                    f"speedtest: "
-                    f"dl={speed_sample.download_mbps} Mbps, "
-                    f"ul={speed_sample.upload_mbps} Mbps",
-                )
 
             # Events.
             for ev in wifi_events:
@@ -1847,6 +2179,18 @@ def main():
         help="Run without the curses TUI (pair with web_dashboard.py)",
     )
     parser.add_argument(
+        "--web", action="store_true",
+        help="Run the web dashboard inside this process in a background thread",
+    )
+    parser.add_argument(
+        "--port", type=int, default=5000,
+        help="Port for the web dashboard (default: 5000, used with --web)",
+    )
+    parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="Host for the web dashboard (default: 127.0.0.1, used with --web)",
+    )
+    parser.add_argument(
         "--debug", action="store_true",
         help=(
             "Log every subprocess command and its response to "
@@ -1888,6 +2232,19 @@ def main():
 
     retention = threading.Thread(target=monitor.retention_loop, daemon=True)
     retention.start()
+
+    if args.web:
+        import web_dashboard
+        web_dashboard.DB_PATH = monitor.storage._path
+        web_dashboard.INCIDENTS_PATH = monitor.config["storage"]["incidents_path"]
+        logging.getLogger("werkzeug").setLevel(logging.WARNING)
+        web_thread = threading.Thread(
+            target=web_dashboard.app.run,
+            kwargs={"host": args.host, "port": args.port, "debug": False, "use_reloader": False},
+            daemon=True,
+        )
+        web_thread.start()
+        print(f"Web Dashboard started at http://{args.host}:{args.port}")
 
     if args.headless:
         print("Running in headless mode. Press Ctrl+C to stop.")

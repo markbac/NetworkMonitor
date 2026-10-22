@@ -164,3 +164,48 @@ CREATE INDEX IF NOT EXISTS idx_tcp_ts        ON tcp_states          (timestamp);
 CREATE INDEX IF NOT EXISTS idx_scan_ts       ON wifi_scan_results   (scan_timestamp);
 CREATE INDEX IF NOT EXISTS idx_bloat_ts      ON bufferbloat_samples (timestamp);
 CREATE INDEX IF NOT EXISTS idx_speed_ts      ON speed_test_results  (timestamp);
+
+-- ---------------------------------------------------------------------------
+-- action_queue
+-- On-demand requests from the web dashboard or CLI (speedtest, traceroute, etc.)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS action_queue (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp   TEXT    NOT NULL,
+    action      TEXT    NOT NULL,
+    payload     TEXT,
+    status      TEXT    NOT NULL DEFAULT 'pending',
+    result      TEXT
+);
+
+-- ---------------------------------------------------------------------------
+-- process_samples
+-- Per-process network activity snapshots (network hog identification)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS process_samples (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp      TEXT    NOT NULL,
+    pid            INTEGER NOT NULL,
+    name           TEXT    NOT NULL,
+    conn_count     INTEGER DEFAULT 0,
+    read_bytes_ps  REAL    DEFAULT 0,
+    write_bytes_ps REAL    DEFAULT 0
+);
+
+-- ---------------------------------------------------------------------------
+-- dns_benchmarks
+-- Periodic side-by-side DNS latency benchmarks against public resolvers
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS dns_benchmarks (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp      TEXT    NOT NULL,
+    local_ms       REAL,
+    cloudflare_ms  REAL,
+    google_ms      REAL,
+    quad9_ms       REAL,
+    fastest        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_action_status ON action_queue        (status);
+CREATE INDEX IF NOT EXISTS idx_proc_ts       ON process_samples     (timestamp);
+CREATE INDEX IF NOT EXISTS idx_dns_bench_ts  ON dns_benchmarks      (timestamp);

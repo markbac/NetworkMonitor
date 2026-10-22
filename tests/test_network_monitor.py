@@ -1,0 +1,207 @@
+import os
+import re
+import sqlite3
+import tempfile
+import unittest
+
+import advanced_network_monitor as anm
+import web_dashboard
+
+
+class TestNetworkMonitor(unittest.TestCase):
+    def test_rolling_stats(self):
+        stats = anm.RollingStats(size=10)
+        self.assertEqual(stats.average(), 0.0)
+        self.assertEqual(stats.jitter(), 0.0)
+        self.assertEqual(stats.packet_loss_rate(), 0.0)
+
+        stats.add(10.0)
+        stats.add(20.0)
+        stats.add(None)  # lost packet
+        stats.add(30.0)
+
+        self.assertEqual(stats.average(), 20.0)
+        self.assertAlmostEqual(stats.packet_loss_rate(), 25.0)
+        # Differences: |20 - 10| = 10, |30 - 20| = 10 -> jitter = 10.0
+        self.assertEqual(stats.jitter(), 10.0)
+
+    def test_host_cycler(self):
+        cycler = anm.HostCycler(["a.com", "b.com"])
+        self.assertEqual(cycler.next(), "a.com")
+        self.assertEqual(cycler.next(), "b.com")
+        self.assertEqual(cycler.next(), "a.com")
+        self.assertEqual(cycler.all(), ["a.com", "b.com"])
+
+        with self.assertRaises(ValueError):
+            anm.HostCycler([])
+
+    def test_ping_regex_parsing(self):
+        # Standard Windows ping reply
+        output_std = "Reply from 1.1.1.1: bytes=32 time=9ms TTL=59\r\n"
+        m = re.search(r"time[=<](\d+(?:\.\d+)?)ms", output_std, re.IGNORECASE)
+        self.assertIsNotNone(m)
+        self.assertEqual(float(m.group(1)), 9.0)
+
+        # Fast LAN ping (<1ms)
+        output_fast = "Reply from 192.168.1.1: bytes=32 time<1ms TTL=64\r\n"
+        self.assertTrue("<1ms" in output_fast)
+
+        # Timeout / failure
+        output_fail = "Request timed out.\r\n"
+        m_fail = re.search(r"time[=<](\d+(?:\.\d+)?)ms", output_fail, re.IGNORECASE)
+        self.assertIsNone(m_fail)
+
+    def test_storage_thread_safety_and_actions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            storage = anm.Storage(db_path)
+            try:
+                # Test WAL mode enabled
+                cur = storage.connection.execute("PRAGMA journal_mode;")
+                mode = cur.fetchone()[0]
+                self.assertEqual(mode.lower(), "wal")
+
+                # Test action queue
+                storage.connection.execute(
+                    "INSERT INTO action_queue (timestamp, action, payload, status) VALUES (?,?,?,?)",
+                    ("2026-10-22T22:00:00", "speedtest", "", "pending"),
+                )
+                storage.connection.commit()
+
+                pending = storage.poll_pending_action()
+                self.assertIsNotNone(pending)
+                self.assertEqual(pending["action"], "speedtest")
+
+                # Next poll should be empty since status was set to running
+                self.assertIsNone(storage.poll_pending_action())
+
+                storage.update_action(pending["id"], "completed", "Test success")
+                cur = storage.connection.execute(
+                    "SELECT status, result FROM action_queue WHERE id = ?", (pending["id"],)
+                )
+                row = cur.fetchone()
+                self.assertEqual(row[0], "completed")
+                self.assertEqual(row[1], "Test success")
+            finally:
+                storage.close()
+
+    def test_n_param_sanitization(self):
+        with web_dashboard.app.test_request_context("/api/history?n=-1"):
+            self.assertEqual(web_dashboard.n_param(), 1)
+
+        with web_dashboard.app.test_request_context("/api/history?n=50000"):
+            self.assertEqual(web_dashboard.n_param(), 10000)
+
+        with web_dashboard.app.test_request_context("/api/history?n=invalid"):
+            self.assertEqual(web_dashboard.n_param(), 300)
+
+    def test_web_dashboard_routes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            storage = anm.Storage(db_path)
+            try:
+                # Populate sample data
+                s = anm.Sample(
+                    timestamp="2026-10-22T22:00:00",
+                    probed_host="1.1.1.1",
+                    internet_ping=12.5,
+                    gateway_ping=1.0,
+                    dns_ms=15.0,
+                    dns_server_ms=14.0,
+                    http_ms=45.0,
+                    packet_loss_rate=0.0,
+                    ip_address="192.168.1.100",
+                    dns_server="1.1.1.1",
+                    cpu_pct=5.0,
+                    ram_pct=40.0,
+                    probe_duration_ms=120.0,
+                    notes="",
+                )
+                storage.insert_sample(s)
+
+                storage.insert_process_samples([
+                    anm.ProcessSample(
+                        timestamp="2026-10-22T22:00:00",
+                        pid=1234,
+                        name="testapp.exe",
+                        conn_count=3,
+                        read_bytes_ps=50000.0,
+                        write_bytes_ps=10000.0,
+                    )
+                ])
+
+                storage.insert_dns_benchmark(anm.DnsBenchmarkSample(
+                    timestamp="2026-10-22T22:00:00",
+                    local_ms=25.0,
+                    cloudflare_ms=12.0,
+                    google_ms=18.0,
+                    quad9_ms=20.0,
+                    fastest="Cloudflare",
+                ))
+
+                storage.insert_wifi_scan([
+                    anm.WifiScanEntry(
+                        scan_timestamp="2026-10-22T22:00:00",
+                        ssid="TestWifi",
+                        bssid="aa:bb:cc:dd:ee:ff",
+                        signal_pct=85,
+                        channel=6,
+                        band="2.4GHz",
+                        authentication="WPA2",
+                        cipher="CCMP",
+                    ),
+                    anm.WifiScanEntry(
+                        scan_timestamp="2026-10-22T22:00:00",
+                        ssid="OtherWifi",
+                        bssid="11:22:33:44:55:66",
+                        signal_pct=40,
+                        channel=11,
+                        band="2.4GHz",
+                        authentication="WPA2",
+                        cipher="CCMP",
+                    ),
+                ])
+            finally:
+                storage.close()
+
+            web_dashboard.DB_PATH = db_path
+            web_dashboard.INCIDENTS_PATH = os.path.join(tmpdir, "incidents")
+            os.makedirs(web_dashboard.INCIDENTS_PATH, exist_ok=True)
+
+            client = web_dashboard.app.test_client()
+
+            # Test /api/latest
+            resp = client.get("/api/latest")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.json["probed_host"], "1.1.1.1")
+
+            # Test /api/processes (Feature 3)
+            resp = client.get("/api/processes")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(len(resp.json), 1)
+            self.assertEqual(resp.json[0]["name"], "testapp.exe")
+
+            # Test /api/dns_benchmark (Feature 6)
+            resp = client.get("/api/dns_benchmark")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(len(resp.json), 1)
+            self.assertEqual(resp.json[0]["fastest"], "Cloudflare")
+
+            # Test /api/wifi_channels (Feature 7)
+            resp = client.get("/api/wifi_channels")
+            self.assertEqual(resp.status_code, 200)
+            self.assertIn("recommendation_24", resp.json)
+            self.assertEqual(resp.json["best_channel_24"], 1)
+
+            # Test /api/actions POST & GET (Feature 1)
+            resp = client.post("/api/actions", json={"action": "speedtest"})
+            self.assertEqual(resp.status_code, 202)
+            self.assertIn("id", resp.json)
+
+            resp = client.get("/api/actions/latest")
+            self.assertEqual(resp.status_code, 200)
+            self.assertTrue(len(resp.json) >= 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

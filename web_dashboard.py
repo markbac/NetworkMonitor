@@ -43,8 +43,16 @@ INCIDENTS_PATH: str = ""
 # ---------------------------------------------------------------------------
 
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5)
+    conn.execute("PRAGMA busy_timeout = 5000;")
     conn.row_factory = sqlite3.Row
+    return conn
+
+
+def get_write_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    conn.execute("PRAGMA journal_mode = WAL;")
+    conn.execute("PRAGMA busy_timeout = 5000;")
     return conn
 
 
@@ -58,8 +66,9 @@ def query(sql: str, params: tuple = ()) -> list[dict]:
 
 def n_param(default: int = 300, cap: int = 10_000) -> int:
     try:
-        return min(int(request.args.get("n", default)), cap)
-    except ValueError:
+        val = int(request.args.get("n", default))
+        return max(1, min(val, cap))
+    except (ValueError, TypeError):
         return default
 
 
@@ -273,6 +282,106 @@ def api_export():
     import json as json_mod
     from datetime import timedelta
 
+@app.route("/api/processes")
+def api_processes():
+    """Return top active network processes from the latest sample."""
+    latest_ts = query("SELECT MAX(timestamp) AS ts FROM process_samples")
+    if not latest_ts or not latest_ts[0]["ts"]:
+        return jsonify([])
+    ts = latest_ts[0]["ts"]
+    rows = query("""
+        SELECT * FROM process_samples
+        WHERE timestamp = ?
+        ORDER BY (read_bytes_ps + write_bytes_ps) DESC, conn_count DESC
+        LIMIT 10
+    """, (ts,))
+    return jsonify(rows)
+
+
+@app.route("/api/dns_benchmark")
+def api_dns_benchmark():
+    """Return latest DNS benchmark result and history."""
+    rows = query(
+        "SELECT * FROM dns_benchmarks ORDER BY timestamp DESC LIMIT ?",
+        (n_param(default=20, cap=100),),
+    )
+    return jsonify(rows)
+
+
+@app.route("/api/wifi_channels")
+def api_wifi_channels():
+    """Compute channel congestion distribution from the latest Wi-Fi environment scan."""
+    latest = query("SELECT MAX(scan_timestamp) AS ts FROM wifi_scan_results")
+    if not latest or not latest[0]["ts"]:
+        return jsonify({"channels_24": {}, "channels_5": {}, "recommendation_24": None})
+    rows = query(
+        "SELECT * FROM wifi_scan_results WHERE scan_timestamp = ?",
+        (latest[0]["ts"],),
+    )
+    channels_24 = {}
+    channels_5 = {}
+    for r in rows:
+        ch = r.get("channel")
+        if ch is None:
+            continue
+        band = r.get("band") or ("2.4GHz" if ch <= 14 else "5GHz")
+        target = channels_24 if "2.4" in str(band) or ch <= 14 else channels_5
+        if ch not in target:
+            target[ch] = {"count": 0, "max_signal": 0}
+        target[ch]["count"] += 1
+        sig = r.get("signal_pct") or 0
+        if sig > target[ch]["max_signal"]:
+            target[ch]["max_signal"] = sig
+
+    # Find cleanest standard 2.4 GHz channel among 1, 6, 11
+    best_ch = None
+    min_score = 999999
+    for ch in [1, 6, 11]:
+        c_info = channels_24.get(ch, {"count": 0, "max_signal": 0})
+        score = c_info["count"] * 10 + c_info["max_signal"]
+        if score < min_score:
+            min_score = score
+            best_ch = ch
+
+    rec = f"Channel {best_ch} has the lowest interference among standard channels (1, 6, 11)" if best_ch else None
+    return jsonify({
+        "scan_timestamp": latest[0]["ts"],
+        "channels_24": channels_24,
+        "channels_5": channels_5,
+        "recommendation_24": rec,
+        "best_channel_24": best_ch,
+    })
+
+
+@app.route("/api/actions", methods=["POST"])
+def api_queue_action():
+    """Queue an on-demand diagnostic action (speedtest, bufferbloat, traceroute, etc.)."""
+    data = request.get_json(silent=True) or {}
+    action = data.get("action")
+    payload = data.get("payload", "")
+    allowed = {"speedtest", "bufferbloat", "traceroute", "wifiscan", "dns_benchmark"}
+    if action not in allowed:
+        return jsonify({"error": f"Invalid action '{action}'. Allowed: {', '.join(allowed)}"}), 400
+
+    ts = datetime.now().isoformat()
+    conn = get_write_db()
+    try:
+        cur = conn.execute(
+            "INSERT INTO action_queue (timestamp, action, payload, status) VALUES (?,?,?,?)",
+            (ts, action, payload, "pending"),
+        )
+        conn.commit()
+        action_id = cur.lastrowid
+        return jsonify({"id": action_id, "status": "pending", "action": action}), 202
+    finally:
+        conn.close()
+
+
+@app.route("/api/actions/latest")
+def api_latest_actions():
+    rows = query("SELECT * FROM action_queue ORDER BY id DESC LIMIT 5")
+    return jsonify(rows)
+
     VALID_TABLES = {
         "samples":             "timestamp",
         "events":              "timestamp",
@@ -282,6 +391,9 @@ def api_export():
         "wifi_scan_results":   "scan_timestamp",
         "bufferbloat_samples": "timestamp",
         "speed_test_results":  "timestamp",
+        "action_queue":        "timestamp",
+        "process_samples":     "timestamp",
+        "dns_benchmarks":      "timestamp",
     }
 
     table   = request.args.get("table", "samples")
@@ -336,18 +448,14 @@ def api_export():
 
 @app.route("/api/incidents/<filename>")
 def api_incident_content(filename: str):
-    """Return the text content of a single incident file.
-
-    Validates that the filename matches the expected pattern and exists
-    within INCIDENTS_PATH to prevent directory traversal.
-    """
-    # Only allow the expected naming pattern.
+    """Return the text content of a single incident file safely."""
     if not filename.startswith("incident_") or not filename.endswith(".txt"):
         return jsonify({"error": "Invalid filename"}), 400
-    path = Path(INCIDENTS_PATH) / filename
-    if not path.exists() or not path.is_file():
+    target = (Path(INCIDENTS_PATH) / filename).resolve()
+    inc_dir = Path(INCIDENTS_PATH).resolve()
+    if not target.is_relative_to(inc_dir) or not target.is_file():
         return jsonify({"error": "Not found"}), 404
-    return Response(path.read_text(encoding="utf-8", errors="replace"),
+    return Response(target.read_text(encoding="utf-8", errors="replace"),
                     mimetype="text/plain")
 
 
@@ -437,6 +545,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   /* Progress bar for CPU/RAM */
   .pbar{height:4px;background:#2d3248;border-radius:2px;margin-top:4px}
   .pbar-fill{height:100%;border-radius:2px}
+  /* Action buttons */
+  .act-btn{background:#1e3a5f;color:#7dd3fc;border:1px solid #2d6a9f;border-radius:6px;padding:6px 14px;font-size:.78rem;font-weight:600;cursor:pointer;transition:all 0.15s ease}
+  .act-btn:hover{background:#2563eb;color:#ffffff}
+  .act-btn:disabled{background:#1a202c;color:#64748b;border-color:#2d3748;cursor:not-allowed}
+  .spinner{display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,.3);border-radius:50%;border-top-color:#fff;animation:spin 1s ease-in-out infinite;margin-right:6px}
+  @keyframes spin{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
@@ -452,6 +566,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <span id="sampleCount">Samples: —</span>
     <span id="updated">—</span>
   </div>
+</div>
+
+<!-- Quick Actions Panel (Feature 1) -->
+<div class="card" style="margin-bottom:16px">
+  <h2>&#9889; On-Demand Actions</h2>
+  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+    <button class="act-btn" id="btnSpeed" onclick="triggerAction('speedtest', this)">&#128640; Run Speed Test</button>
+    <button class="act-btn" id="btnBloat" onclick="triggerAction('bufferbloat', this)">&#128200; Run Bufferbloat Test</button>
+    <button class="act-btn" id="btnScan" onclick="triggerAction('wifiscan', this)">&#128246; Scan Wi-Fi Now</button>
+    <button class="act-btn" id="btnDns" onclick="triggerAction('dns_benchmark', this)">&#127760; Benchmark DNS</button>
+    <div style="display:flex;gap:4px;align-items:center;margin-left:auto">
+      <input id="traceTarget" type="text" placeholder="1.1.1.1" value="1.1.1.1" style="background:#0f1117;color:#e2e8f0;border:1px solid #2d3248;border-radius:4px;padding:6px 8px;font-size:.78rem;width:130px">
+      <button class="act-btn" onclick="triggerTraceroute(this)">&#128269; Traceroute</button>
+    </div>
+  </div>
+  <div id="actionStatus" style="font-size:0.75rem;color:#7dd3fc;margin-top:10px;display:none"></div>
 </div>
 
 <!-- Metrics -->
@@ -491,6 +621,27 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </div>
 
 <p class="note">Auto-refreshes every 5 s</p>
+
+<!-- Multi-DNS Benchmark (Feature 6) & Network Hogs (Feature 3) -->
+<div class="two-col">
+  <div class="card">
+    <h2>&#127760; Multi-DNS Latency Benchmark <span id="dnsBenchFastest" class="badge b-ok" style="margin-left:8px"></span></h2>
+    <div class="mgrid" style="grid-template-columns:repeat(auto-fit,minmax(110px,1fr));margin-bottom:8px">
+      <div class="metric"><div class="lbl">Local ISP DNS</div><div><span class="val" id="dLocal">--</span><span class="unit">ms</span></div></div>
+      <div class="metric"><div class="lbl">Cloudflare (1.1.1.1)</div><div><span class="val" id="dCf">--</span><span class="unit">ms</span></div></div>
+      <div class="metric"><div class="lbl">Google (8.8.8.8)</div><div><span class="val" id="dGoog">--</span><span class="unit">ms</span></div></div>
+      <div class="metric"><div class="lbl">Quad9 (9.9.9.9)</div><div><span class="val" id="dQuad">--</span><span class="unit">ms</span></div></div>
+    </div>
+    <div id="dnsRecommendation" style="font-size:0.75rem;color:#7dd3fc;margin-top:6px"></div>
+  </div>
+  <div class="card">
+    <h2>&#128187; Top Network Applications (Network Hogs)</h2>
+    <table>
+      <thead><tr><th>Application</th><th>PID</th><th>Connections</th><th>Download</th><th>Upload</th></tr></thead>
+      <tbody id="tProcesses"><tr><td colspan="5" class="dim">Sampling processes&hellip;</td></tr></tbody>
+    </table>
+  </div>
+</div>
 
 <!-- Latency + DNS/HTTP -->
 <div class="two-col">
@@ -580,7 +731,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <option>samples</option><option>events</option><option>wifi_samples</option>
         <option>nic_samples</option><option>tcp_states</option>
         <option>wifi_scan_results</option><option>bufferbloat_samples</option>
-        <option>speed_test_results</option>
+        <option>speed_test_results</option><option>action_queue</option><option>process_samples</option><option>dns_benchmarks</option>
       </select>
     </div>
     <div>
@@ -606,6 +757,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <!-- TCP states -->
 <div class="card"><h2>TCP Connection States (current)</h2>
   <div class="chart-wrap" style="height:140px"><canvas id="cTcp"></canvas></div></div>
+
+<!-- Wi-Fi Channel Overlap & Congestion (Feature 7) -->
+<div class="card">
+  <h2>&#128246; Wi-Fi Channel Overlap &amp; Congestion <span id="wifiChanRec" class="badge b-ok" style="margin-left:8px"></span></h2>
+  <div class="two-col" style="margin-top:10px">
+    <div>
+      <h3 style="font-size:.72rem;color:#94a3b8;margin-bottom:6px">2.4 GHz Spectrum (Channels 1–13)</h3>
+      <div class="chart-wrap" style="height:150px"><canvas id="cChan24"></canvas></div>
+    </div>
+    <div>
+      <h3 style="font-size:.72rem;color:#94a3b8;margin-bottom:6px">5 GHz Spectrum Channels</h3>
+      <div class="chart-wrap" style="height:150px"><canvas id="cChan5"></canvas></div>
+    </div>
+  </div>
+</div>
 
 <!-- Wi-Fi environment scan -->
 <div class="card">
@@ -674,6 +840,16 @@ const cSys     = mkChart('cSys',     [ds('CPU %','rgb(56,189,248)'), ds('RAM %',
 const cWifi    = mkChart('cWifi',    [ds('Signal %','rgb(167,139,250)',true)], '%');
 const cSpeedDl = mkChart('cSpeedDl', [ds('Download Mbps','rgb(52,211,153)',true)], 'Mbps');
 const cSpeedUl = mkChart('cSpeedUl', [ds('Upload Mbps',  'rgb(251,191,36)',true)], 'Mbps');
+const cChan24  = new Chart(document.getElementById('cChan24').getContext('2d'), {
+  type:'bar',
+  data:{ labels:['1','2','3','4','5','6','7','8','9','10','11','12','13'], datasets:[{ label:'APs on Channel', data:[], backgroundColor:'rgba(56,189,248,.6)' }] },
+  options:{ responsive:true, maintainAspectRatio:false, animation:false, plugins:{ legend:{ display:false } }, scales:{ x:{ ticks:{ color:G.text, font:{size:9} }, grid:{ color:G.grid } }, y:{ ticks:{ color:G.text, stepSize:1, font:{size:9} }, grid:{ color:G.grid }, beginAtZero:true } } },
+});
+const cChan5   = new Chart(document.getElementById('cChan5').getContext('2d'), {
+  type:'bar',
+  data:{ labels:[], datasets:[{ label:'APs on Channel', data:[], backgroundColor:'rgba(167,139,250,.6)' }] },
+  options:{ responsive:true, maintainAspectRatio:false, animation:false, plugins:{ legend:{ display:false } }, scales:{ x:{ ticks:{ color:G.text, font:{size:9} }, grid:{ color:G.grid } }, y:{ ticks:{ color:G.text, stepSize:1, font:{size:9} }, grid:{ color:G.grid }, beginAtZero:true } } },
+});
 
 // NIC charts are initialised empty; datasets are added dynamically as new
 // interface names are discovered. This handles any number of NICs and Wi-Fi
@@ -1187,12 +1363,160 @@ async function updateIfaceTimeline() {
     `— ${ifaces.length} active adapter${ifaces.length !== 1 ? 's' : ''}`;
 }
 
+
+// ---------------------------------------------------------------------------
+// On-Demand Actions & Pollers (Feature 1)
+// ---------------------------------------------------------------------------
+async function triggerAction(actionName, btn) {
+  if (btn) btn.disabled = true;
+  const statusEl = document.getElementById('actionStatus');
+  statusEl.style.display = 'block';
+  statusEl.innerHTML = `<span class="spinner"></span>Requesting ${actionName}...`;
+  try {
+    const r = await fetch('/api/actions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: actionName })
+    });
+    const d = await r.json();
+    if (d.id) {
+      statusEl.innerHTML = `<span class="spinner"></span>${actionName} queued (ID ${d.id}), running in background...`;
+      pollAction(d.id, btn);
+    } else {
+      statusEl.textContent = d.error || 'Failed to queue action';
+      if (btn) btn.disabled = false;
+    }
+  } catch (err) {
+    statusEl.textContent = `Action failed: ${err}`;
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function triggerTraceroute(btn) {
+  const target = document.getElementById('traceTarget').value.trim() || '1.1.1.1';
+  if (btn) btn.disabled = true;
+  const statusEl = document.getElementById('actionStatus');
+  statusEl.style.display = 'block';
+  statusEl.innerHTML = `<span class="spinner"></span>Running traceroute to ${target}... (may take 30-60s)`;
+  try {
+    const r = await fetch('/api/actions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'traceroute', payload: target })
+    });
+    const d = await r.json();
+    if (d.id) {
+      pollAction(d.id, btn);
+    } else {
+      statusEl.textContent = d.error || 'Failed to start traceroute';
+      if (btn) btn.disabled = false;
+    }
+  } catch (err) {
+    statusEl.textContent = `Traceroute request failed: ${err}`;
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function pollAction(id, btn) {
+  const statusEl = document.getElementById('actionStatus');
+  const timer = setInterval(async () => {
+    const r = await fetch('/api/actions/latest').catch(()=>null);
+    if (!r?.ok) return;
+    const items = await r.json();
+    const item = items.find(x => x.id === id);
+    if (item) {
+      if (item.status === 'completed') {
+        clearInterval(timer);
+        statusEl.innerHTML = `&#10004; ${item.result || (item.action + ' finished successfully')}`;
+        if (btn) btn.disabled = false;
+        refresh();
+      } else if (item.status === 'failed') {
+        clearInterval(timer);
+        statusEl.innerHTML = `&#10008; ${item.result || (item.action + ' failed')}`;
+        if (btn) btn.disabled = false;
+      }
+    }
+  }, 2000);
+}
+
+// ---------------------------------------------------------------------------
+// Process Network Hogs (Feature 3)
+// ---------------------------------------------------------------------------
+async function updateProcesses() {
+  const r = await fetch('/api/processes').catch(()=>null);
+  if (!r?.ok) return;
+  const rows = await r.json();
+  const tb = document.getElementById('tProcesses');
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="5" class="dim">No network-active applications detected</td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.map(p => `<tr>
+    <td style="font-weight:600;color:#f8fafc">${p.name}</td>
+    <td class="mono" style="color:#64748b">${p.pid}</td>
+    <td>${p.conn_count} conn${p.conn_count !== 1 ? 's' : ''}</td>
+    <td style="color:#34d399">&darr; ${(p.read_bytes_ps/1024).toFixed(1)} KB/s</td>
+    <td style="color:#fbbf24">&uarr; ${(p.write_bytes_ps/1024).toFixed(1)} KB/s</td>
+  </tr>`).join('');
+}
+
+// ---------------------------------------------------------------------------
+// Multi-DNS Benchmark (Feature 6)
+// ---------------------------------------------------------------------------
+async function updateDnsBenchmark() {
+  const r = await fetch('/api/dns_benchmark?n=1').catch(()=>null);
+  if (!r?.ok) return;
+  const rows = await r.json();
+  if (!rows.length) return;
+  const b = rows[0];
+  document.getElementById('dLocal').textContent = fmt(b.local_ms);
+  document.getElementById('dCf').textContent    = fmt(b.cloudflare_ms);
+  document.getElementById('dGoog').textContent  = fmt(b.google_ms);
+  document.getElementById('dQuad').textContent  = fmt(b.quad9_ms);
+  if (b.fastest) {
+    document.getElementById('dnsBenchFastest').textContent = `Fastest: ${b.fastest}`;
+    if (b.local_ms && b.cloudflare_ms && b.cloudflare_ms < b.local_ms) {
+      const diff = Math.round(b.local_ms - b.cloudflare_ms);
+      document.getElementById('dnsRecommendation').textContent =
+        `Tip: Cloudflare (1.1.1.1) is ${diff} ms faster than your Local ISP DNS.`;
+    } else {
+      document.getElementById('dnsRecommendation').textContent =
+        'Local DNS latency is healthy and competitive with public resolvers.';
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Wi-Fi Channel Overlap (Feature 7)
+// ---------------------------------------------------------------------------
+async function updateWifiChannels() {
+  const r = await fetch('/api/wifi_channels').catch(()=>null);
+  if (!r?.ok) return;
+  const data = await r.json();
+  if (data.recommendation_24) {
+    document.getElementById('wifiChanRec').textContent = data.recommendation_24;
+  }
+  // 2.4 GHz channels 1..13
+  const c24Counts = [1,2,3,4,5,6,7,8,9,10,11,12,13].map(ch => data.channels_24[ch]?.count || 0);
+  cChan24.data.datasets[0].data = c24Counts;
+  cChan24.update('none');
+
+  // 5 GHz channels
+  const ch5Keys = Object.keys(data.channels_5).sort((a,b) => Number(a)-Number(b));
+  if (ch5Keys.length) {
+    cChan5.data.labels = ch5Keys;
+    cChan5.data.datasets[0].data = ch5Keys.map(k => data.channels_5[k].count);
+    cChan5.update('none');
+  }
+}
+
 async function refresh() {
   await Promise.all([
     updateStatus(), updateLatest(), updateHistory(),
     updateWifi(), updateNicActive(), updateIfaceTimeline(),
     updateNic(), updateTcp(), updateBloat(), updateSpeed(),
     updateEvents(), updateIncidents(), updateWifiScan(),
+    updateProcesses(), updateDnsBenchmark(), updateWifiChannels(),
   ]);
 }
 
