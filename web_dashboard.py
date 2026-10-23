@@ -1,70 +1,83 @@
-#!/usr/bin/env python3
 """
-web_dashboard.py -- Network Observability Web Dashboard
+web_dashboard.py - Real-Time Browser Dashboard for Windows Network Monitor
+==========================================================================
+A lightweight, self-contained Flask dashboard that visualises telemetry from
+the SQLite database maintained by advanced_network_monitor.py.
 
-Serves a read-only web UI over the SQLite database written by
-advanced_network_monitor.py. Runs as a separate process.
-
-Endpoints
----------
-  GET /                           Dashboard HTML
-  GET /api/latest                 Most recent sample
-  GET /api/history?n=300          Last n samples, oldest-first
-  GET /api/events?n=100           Last n events, newest-first
-  GET /api/wifi?n=300             Last n Wi-Fi samples, oldest-first
-  GET /api/nic?n=300              Last n NIC samples, oldest-first
-  GET /api/tcp?n=1                Last n TCP state snapshots
-  GET /api/incidents              Incident file list
-  GET /api/incidents/<filename>   Content of a specific incident file
-  GET /api/status                 DB size, sample count, last timestamp
-
-Requirements: flask pyyaml
+Includes:
+- Multi-tab navigation (Telemetry, LAN & Devices, Wi-Fi & RF, Diagnostics, Events & Export, All Panels)
+- Historical time-range filtering (5m, 15m, 1h, 6h, 24h)
+- LAN ARP Neighbor Device discovery with OUI hardware vendor identification
+- mDNS / Bonjour / ZeroConf smart device discovery
+- Path MTU & gateway port health diagnostics
+- Real-time latency, DNS, HTTP, packet loss, CPU/RAM, TCP states
+- Wi-Fi signal, 2.4/5 GHz channel congestion & RF spectrum overlap
+- Network Hog process bandwidth attribution
+- Multi-DNS resolver latency benchmark
+- Bufferbloat & automated/on-demand speed testing
+- Data export (CSV/JSON) and expandable incident diagnostic reports
 """
-
-from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import yaml
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, render_template_string, request
 
-CONFIG_FILE = "config/default.yaml"
+# ---------------------------------------------------------------------------
+# Configuration & Globals
+# ---------------------------------------------------------------------------
 
-app = Flask(__name__)
-DB_PATH:        str = ""
+CONFIG_FILE = Path(__file__).parent / "config" / "monitor_config.yaml"
+
+DB_PATH: str = ""
 INCIDENTS_PATH: str = ""
 
+app = Flask(__name__)
+
+# Mutex to guard SQLite write access in multi-threaded Flask server
+_db_write_lock = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
-# DB helpers
+# Database Helpers
 # ---------------------------------------------------------------------------
 
-def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5)
-    conn.execute("PRAGMA busy_timeout = 5000;")
+def get_read_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000;")
     return conn
 
 
 def get_write_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=5)
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
+    conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL;")
     conn.execute("PRAGMA busy_timeout = 5000;")
     return conn
 
 
-def query(sql: str, params: tuple = ()) -> list[dict]:
-    conn = get_db()
+def query(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
+    if not DB_PATH or not Path(DB_PATH).exists():
+        return []
     try:
-        return [dict(r) for r in conn.execute(sql, params).fetchall()]
-    finally:
-        conn.close()
+        conn = get_read_db()
+        try:
+            cur = conn.execute(sql, params)
+            return [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        return []
 
 
-def n_param(default: int = 300, cap: int = 10_000) -> int:
+def n_param(default: int = 300, cap: int = 10000) -> int:
     try:
         val = int(request.args.get("n", default))
         return max(1, min(val, cap))
@@ -73,184 +86,174 @@ def n_param(default: int = 300, cap: int = 10_000) -> int:
 
 
 # ---------------------------------------------------------------------------
-# API routes
+# API Routes
 # ---------------------------------------------------------------------------
 
 @app.route("/api/latest")
 def api_latest():
+    """Most recent telemetry sample."""
     rows = query("SELECT * FROM samples ORDER BY timestamp DESC LIMIT 1")
-    if not rows:
-        return jsonify({"error": "No data yet"}), 404
-    return jsonify(rows[0])
+    return jsonify(rows[0] if rows else {})
 
 
 @app.route("/api/history")
 def api_history():
-    rows = query("""
-        SELECT * FROM (SELECT * FROM samples ORDER BY timestamp DESC LIMIT ?)
-        ORDER BY timestamp ASC
-    """, (n_param(),))
-    return jsonify(rows)
+    """Last n telemetry samples, oldest-first for chart rendering."""
+    rows = query(
+        "SELECT * FROM samples ORDER BY timestamp DESC LIMIT ?",
+        (n_param(),),
+    )
+    return jsonify(list(reversed(rows)))
 
 
 @app.route("/api/events")
 def api_events():
+    """Last n events, newest-first."""
     rows = query(
         "SELECT * FROM events ORDER BY timestamp DESC LIMIT ?",
-        (n_param(default=100, cap=5_000),),
+        (n_param(default=100, cap=1000),),
     )
     return jsonify(rows)
 
 
 @app.route("/api/wifi")
 def api_wifi():
-    rows = query("""
-        SELECT * FROM (SELECT * FROM wifi_samples ORDER BY timestamp DESC LIMIT ?)
-        ORDER BY timestamp ASC
-    """, (n_param(),))
-    return jsonify(rows)
+    """Last n Wi-Fi connection samples, oldest-first for chart rendering."""
+    rows = query(
+        "SELECT * FROM wifi_samples ORDER BY timestamp DESC LIMIT ?",
+        (n_param(),),
+    )
+    return jsonify(list(reversed(rows)))
 
 
 @app.route("/api/nic")
 def api_nic():
-    rows = query("""
-        SELECT * FROM (SELECT * FROM nic_samples ORDER BY timestamp DESC LIMIT ?)
-        ORDER BY timestamp ASC
-    """, (n_param(),))
-    return jsonify(rows)
+    """Last n NIC throughput samples, oldest-first for chart rendering."""
+    rows = query(
+        "SELECT * FROM nic_samples ORDER BY timestamp DESC LIMIT ?",
+        (n_param(),),
+    )
+    return jsonify(list(reversed(rows)))
 
 
 @app.route("/api/nic/active")
 def api_nic_active():
-    """Return the interface with the highest combined bytes/s in the last sample.
-
-    Also returns all interfaces from the last cycle with their rates, so the
-    dashboard can display a ranked list and highlight the active one.
-    """
-    latest_ts = query(
-        "SELECT MAX(timestamp) AS ts FROM nic_samples"
-    )
+    """Determine the currently active physical network adapter based on recent throughput."""
+    latest_ts = query("SELECT MAX(timestamp) AS ts FROM nic_samples")
     if not latest_ts or not latest_ts[0]["ts"]:
         return jsonify({"active": None, "interfaces": []})
 
     ts = latest_ts[0]["ts"]
-    rows = query("""
-        SELECT *, (bytes_sent_ps + bytes_recv_ps) AS total_bps
-        FROM nic_samples WHERE timestamp = ?
-        ORDER BY total_bps DESC
-    """, (ts,))
-
-    return jsonify({
-        "active": rows[0]["interface"] if rows else None,
-        "interfaces": rows,
-        "timestamp": ts,
-    })
+    rows = query(
+        "SELECT interface, bytes_sent_ps, bytes_recv_ps, "
+        "(bytes_sent_ps + bytes_recv_ps) AS total_bps "
+        "FROM nic_samples WHERE timestamp = ? "
+        "ORDER BY total_bps DESC",
+        (ts,),
+    )
+    active = rows[0]["interface"] if rows and rows[0]["total_bps"] > 1024 else None
+    return jsonify({"active": active, "interfaces": rows})
 
 
 @app.route("/api/nic/timeline")
 def api_nic_timeline():
-    """Return per-interface bytes/s over time for the interface activity chart.
-
-    Returns the last n samples per interface, pivoted so the response is a
-    dict of {interface_name: [{timestamp, total_bps}]} for easy JS charting.
-    Only interfaces with meaningful traffic (peak > 1 KB/s) are included to
-    suppress loopback and Hyper-V virtual adapters that generate noise.
-    """
-    n = n_param(default=300)
-
-    # Get all distinct interfaces
-    ifaces = query("SELECT DISTINCT interface FROM nic_samples")
-    result = {}
-
-    for row in ifaces:
-        iface = row["interface"]
-        samples = query("""
-            SELECT * FROM (
-                SELECT timestamp,
-                       (bytes_sent_ps + bytes_recv_ps) AS total_bps
-                FROM nic_samples WHERE interface = ?
-                ORDER BY timestamp DESC LIMIT ?
-            ) ORDER BY timestamp ASC
-        """, (iface, n))
-
-        # Suppress interfaces that never exceeded 1 KB/s in this window.
-        peak = max((s["total_bps"] for s in samples), default=0)
-        if peak > 1024:
-            result[iface] = samples
-
-    return jsonify(result)
+    """Throughput timeline per interface for multi-NIC stacked/line visualization."""
+    n = n_param(default=300, cap=2000)
+    rows = query(
+        "SELECT timestamp, interface, (bytes_sent_ps + bytes_recv_ps) AS total_bps "
+        "FROM nic_samples "
+        "WHERE timestamp IN (SELECT DISTINCT timestamp FROM nic_samples ORDER BY timestamp DESC LIMIT ?) "
+        "ORDER BY timestamp ASC",
+        (n,),
+    )
+    data: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        data.setdefault(r["interface"], []).append({
+            "timestamp": r["timestamp"],
+            "total_bps": r["total_bps"],
+        })
+    return jsonify(data)
 
 
 @app.route("/api/tcp")
 def api_tcp():
-    rows = query("""
-        SELECT * FROM (SELECT * FROM tcp_states ORDER BY timestamp DESC LIMIT ?)
-        ORDER BY timestamp ASC
-    """, (n_param(default=1),))
-    return jsonify(rows)
+    """Last n TCP connection state breakdown samples, oldest-first."""
+    rows = query(
+        "SELECT * FROM tcp_states ORDER BY timestamp DESC LIMIT ?",
+        (n_param(default=60),),
+    )
+    return jsonify(list(reversed(rows)))
 
 
 @app.route("/api/wifi_scan")
 def api_wifi_scan():
-    """Return all rows from the most recent environment scan.
-
-    Finds the latest scan_timestamp then returns every row with that
-    timestamp, ordered by signal strength descending so the strongest
-    networks appear first in the dashboard table.
-    """
-    latest = query(
-        "SELECT MAX(scan_timestamp) AS ts FROM wifi_scan_results"
-    )
+    """Most recent Wi-Fi environment scan results (all visible BSSIDs)."""
+    latest = query("SELECT MAX(scan_timestamp) AS ts FROM wifi_scan_results")
     if not latest or not latest[0]["ts"]:
         return jsonify([])
-    rows = query("""
-        SELECT * FROM wifi_scan_results
-        WHERE scan_timestamp = ?
-        ORDER BY signal_pct DESC
-    """, (latest[0]["ts"],))
+    rows = query(
+        "SELECT * FROM wifi_scan_results WHERE scan_timestamp = ? ORDER BY signal_pct DESC",
+        (latest[0]["ts"],),
+    )
     return jsonify(rows)
 
 
 @app.route("/api/wifi_scan/history")
 def api_wifi_scan_history():
-    """Return distinct scan timestamps for the last n scans (default 60).
+    """Signal strength history for a specific BSSID or SSID over time."""
+    bssid = request.args.get("bssid")
+    ssid  = request.args.get("ssid")
+    n     = n_param(default=100, cap=1000)
 
-    Used by the dashboard to show how many networks were visible per scan
-    over time -- useful for detecting RF environment changes.
-    """
-    rows = query("""
-        SELECT scan_timestamp, COUNT(*) AS network_count
-        FROM wifi_scan_results
-        GROUP BY scan_timestamp
-        ORDER BY scan_timestamp DESC
-        LIMIT ?
-    """, (n_param(default=60, cap=1440),))
-    return jsonify(rows)
+    if bssid:
+        rows = query(
+            "SELECT scan_timestamp, ssid, bssid, signal_pct, channel, band "
+            "FROM wifi_scan_results WHERE bssid = ? "
+            "ORDER BY scan_timestamp DESC LIMIT ?",
+            (bssid, n),
+        )
+    elif ssid:
+        rows = query(
+            "SELECT scan_timestamp, ssid, bssid, signal_pct, channel, band "
+            "FROM wifi_scan_results WHERE ssid = ? "
+            "ORDER BY scan_timestamp DESC LIMIT ?",
+            (ssid, n),
+        )
+    else:
+        return jsonify({"error": "bssid or ssid parameter required"}), 400
+
+    return jsonify(list(reversed(rows)))
 
 
 @app.route("/api/incidents")
 def api_incidents():
-    """List incident files with name, size, and modification time."""
-    path = Path(INCIDENTS_PATH)
-    if not path.exists():
+    """List diagnostic incident files, newest-first."""
+    inc_dir = Path(INCIDENTS_PATH)
+    if not inc_dir.exists():
         return jsonify([])
-    incidents = []
-    for f in sorted(path.glob("incident_*.txt"), reverse=True):
-        st = f.stat()
-        incidents.append({
-            "filename": f.name,
-            "size_bytes": st.st_size,
-            "modified": datetime.fromtimestamp(st.st_mtime).isoformat(),
-        })
-    return jsonify(incidents)
+
+    files = []
+    for f in inc_dir.glob("incident_*.txt"):
+        try:
+            stat = f.stat()
+            files.append({
+                "filename":   f.name,
+                "size_bytes": stat.st_size,
+                "modified":   datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            })
+        except OSError:
+            pass
+
+    files.sort(key=lambda x: x["modified"], reverse=True)
+    return jsonify(files)
 
 
 @app.route("/api/bufferbloat")
 def api_bufferbloat():
-    """Last n bufferbloat scan results, newest-first."""
+    """Last n bufferbloat measurements, newest-first."""
     rows = query(
         "SELECT * FROM bufferbloat_samples ORDER BY timestamp DESC LIMIT ?",
-        (n_param(default=50, cap=500),),
+        (n_param(default=20, cap=200),),
     )
     return jsonify(rows)
 
@@ -267,20 +270,108 @@ def api_speed_test():
 
 @app.route("/api/export")
 def api_export():
-    """Export a time-windowed slice of any table as CSV or JSON.
-
-    Query parameters
-    ----------------
-    table   -- samples | events | wifi_samples | nic_samples | tcp_states |
-               wifi_scan_results | bufferbloat_samples  (default: samples)
-    from    -- ISO-8601 start timestamp inclusive (default: 24 h ago)
-    to      -- ISO-8601 end timestamp   inclusive (default: now)
-    format  -- csv | json  (default: csv)
-    """
+    """Export a time-windowed slice of any table as CSV or JSON."""
     import csv
     import io
     import json as json_mod
-    from datetime import timedelta
+
+    VALID_TABLES = {
+        "samples":             "timestamp",
+        "events":              "timestamp",
+        "wifi_samples":        "timestamp",
+        "nic_samples":         "timestamp",
+        "tcp_states":          "timestamp",
+        "wifi_scan_results":   "scan_timestamp",
+        "bufferbloat_samples": "timestamp",
+        "speed_test_results":  "timestamp",
+        "action_queue":        "timestamp",
+        "process_samples":     "timestamp",
+        "dns_benchmarks":      "timestamp",
+        "mdns_devices":        "last_seen",
+        "lan_devices":         "last_seen",
+        "mtu_samples":         "timestamp",
+    }
+
+    table   = request.args.get("table", "samples")
+    fmt     = request.args.get("format", "csv").lower()
+    from_ts = request.args.get(
+        "from", (datetime.now() - timedelta(hours=24)).isoformat()
+    )
+    to_ts   = request.args.get("to", datetime.now().isoformat())
+
+    if table not in VALID_TABLES:
+        return jsonify({"error": f"Unknown table '{table}'. "
+                        f"Valid: {', '.join(VALID_TABLES)}"}), 400
+    if fmt not in ("csv", "json"):
+        return jsonify({"error": "format must be csv or json"}), 400
+
+    ts_col = VALID_TABLES[table]
+    rows = query(
+        f"SELECT * FROM {table} "
+        f"WHERE {ts_col} >= ? AND {ts_col} <= ? "
+        f"ORDER BY {ts_col} ASC",
+        (from_ts, to_ts),
+    )
+
+    stem = f"{table}_{from_ts[:10]}_{to_ts[:10]}"
+
+    if fmt == "json":
+        return Response(
+            json_mod.dumps(rows, indent=2),
+            mimetype="application/json",
+            headers={"Content-Disposition": f"attachment; filename={stem}.json"},
+        )
+
+    if not rows:
+        return Response(
+            "",
+            mimetype="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={stem}.csv"},
+        )
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=rows[0].keys())
+    writer.writeheader()
+    writer.writerows(rows)
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={stem}.csv"},
+    )
+
+
+@app.route("/api/mdns")
+def api_mdns():
+    """Return all discovered mDNS / Bonjour / ZeroConf devices."""
+    rows = query("""
+        SELECT ip_address, hostname, services, MAX(last_seen) as last_seen
+        FROM mdns_devices
+        GROUP BY ip_address
+        ORDER BY last_seen DESC
+        LIMIT ?
+    """, (n_param(default=50, cap=200),))
+    return jsonify(rows)
+
+
+@app.route("/api/lan_devices")
+def api_lan_devices():
+    """Return all active LAN ARP neighbor devices with MAC vendors."""
+    rows = query("""
+        SELECT ip_address, mac_address, vendor, interface_ip, device_type, MAX(last_seen) as last_seen
+        FROM lan_devices
+        GROUP BY ip_address
+        ORDER BY ip_address ASC
+        LIMIT ?
+    """, (n_param(default=100, cap=500),))
+    return jsonify(rows)
+
+
+@app.route("/api/mtu")
+def api_mtu():
+    """Return latest Path MTU diagnostics."""
+    rows = query("SELECT * FROM mtu_samples ORDER BY timestamp DESC LIMIT 5")
+    return jsonify(rows)
+
 
 @app.route("/api/processes")
 def api_processes():
@@ -325,20 +416,21 @@ def api_wifi_channels():
         if ch is None:
             continue
         band = r.get("band") or ("2.4GHz" if ch <= 14 else "5GHz")
-        target = channels_24 if "2.4" in str(band) or ch <= 14 else channels_5
-        if ch not in target:
-            target[ch] = {"count": 0, "max_signal": 0}
-        target[ch]["count"] += 1
-        sig = r.get("signal_pct") or 0
-        if sig > target[ch]["max_signal"]:
-            target[ch]["max_signal"] = sig
+        target_dict = channels_24 if "2.4" in band else channels_5
+        if ch not in target_dict:
+            target_dict[ch] = {"count": 0, "ssids": []}
+        target_dict[ch]["count"] += 1
+        if r.get("ssid"):
+            target_dict[ch]["ssids"].append(r["ssid"])
 
-    # Find cleanest standard 2.4 GHz channel among 1, 6, 11
-    best_ch = None
-    min_score = 999999
-    for ch in [1, 6, 11]:
-        c_info = channels_24.get(ch, {"count": 0, "max_signal": 0})
-        score = c_info["count"] * 10 + c_info["max_signal"]
+    # Recommend 2.4 GHz channel among non-overlapping 1, 6, 11
+    best_ch = 1
+    min_score = float("inf")
+    for ch in (1, 6, 11):
+        score = sum(
+            channels_24.get(c, {}).get("count", 0) * max(0, 1 - abs(c - ch) / 5.0)
+            for c in range(1, 14)
+        )
         if score < min_score:
             min_score = score
             best_ch = ch
@@ -359,7 +451,7 @@ def api_queue_action():
     data = request.get_json(silent=True) or {}
     action = data.get("action")
     payload = data.get("payload", "")
-    allowed = {"speedtest", "bufferbloat", "traceroute", "wifiscan", "dns_benchmark"}
+    allowed = {"speedtest", "bufferbloat", "traceroute", "wifiscan", "dns_benchmark", "mdnsscan", "lanscan", "mtuscan"}
     if action not in allowed:
         return jsonify({"error": f"Invalid action '{action}'. Allowed: {', '.join(allowed)}"}), 400
 
@@ -381,69 +473,6 @@ def api_queue_action():
 def api_latest_actions():
     rows = query("SELECT * FROM action_queue ORDER BY id DESC LIMIT 5")
     return jsonify(rows)
-
-    VALID_TABLES = {
-        "samples":             "timestamp",
-        "events":              "timestamp",
-        "wifi_samples":        "timestamp",
-        "nic_samples":         "timestamp",
-        "tcp_states":          "timestamp",
-        "wifi_scan_results":   "scan_timestamp",
-        "bufferbloat_samples": "timestamp",
-        "speed_test_results":  "timestamp",
-        "action_queue":        "timestamp",
-        "process_samples":     "timestamp",
-        "dns_benchmarks":      "timestamp",
-    }
-
-    table   = request.args.get("table", "samples")
-    fmt     = request.args.get("format", "csv").lower()
-    from_ts = request.args.get(
-        "from", (datetime.now() - timedelta(hours=24)).isoformat()
-    )
-    to_ts   = request.args.get("to", datetime.now().isoformat())
-
-    if table not in VALID_TABLES:
-        return jsonify({"error": f"Unknown table '{table}'. "
-                        f"Valid: {', '.join(VALID_TABLES)}"}), 400
-    if fmt not in ("csv", "json"):
-        return jsonify({"error": "format must be csv or json"}), 400
-
-    ts_col = VALID_TABLES[table]
-    rows = query(
-        f"SELECT * FROM {table} "
-        f"WHERE {ts_col} >= ? AND {ts_col} <= ? "
-        f"ORDER BY {ts_col} ASC",
-        (from_ts, to_ts),
-    )
-
-    stem = f"{table}_{from_ts[:10]}_{to_ts[:10]}"
-
-    if fmt == "json":
-        return Response(
-            json_mod.dumps(rows, indent=2),
-            mimetype="application/json",
-            headers={"Content-Disposition": f"attachment; filename={stem}.json"},
-        )
-
-    # CSV -- empty file if no rows (still valid CSV with headers if we had them,
-    # but without rows we have no fieldnames, so return empty body).
-    if not rows:
-        return Response(
-            "",
-            mimetype="text/csv",
-            headers={"Content-Disposition": f"attachment; filename={stem}.csv"},
-        )
-
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=rows[0].keys())
-    writer.writeheader()
-    writer.writerows(rows)
-    return Response(
-        buf.getvalue(),
-        mimetype="text/csv",
-        headers={"Content-Disposition": f"attachment; filename={stem}.csv"},
-    )
 
 
 @app.route("/api/incidents/<filename>")
@@ -473,7 +502,7 @@ def api_status():
 
 
 # ---------------------------------------------------------------------------
-# Dashboard HTML
+# Dashboard HTML Template
 # ---------------------------------------------------------------------------
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -481,13 +510,28 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Network Monitor</title>
+<title>Network Observability Monitor</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <style>
   *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
   body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;padding:20px}
   h1{font-size:1.3rem;font-weight:600;color:#f8fafc;margin-bottom:20px}
-  h2{font-size:0.75rem;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.1em;margin-bottom:12px}
+  h2{font-size:0.75rem;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.1em;margin-bottom:12px;display:flex;align-items:center}
+
+  /* Navigation Tabs */
+  .nav-tabs{display:flex;gap:8px;margin-bottom:16px;background:#161926;border:1px solid #2d3248;border-radius:10px;padding:6px;flex-wrap:wrap}
+  .nav-tab{background:none;border:none;color:#94a3b8;font-size:.82rem;font-weight:600;padding:8px 16px;border-radius:6px;cursor:pointer;transition:all .15s ease}
+  .nav-tab:hover{color:#f8fafc;background:#1e2130}
+  .nav-tab.active{background:#2563eb;color:#ffffff;box-shadow:0 0 10px rgba(37,99,235,.4)}
+
+  /* Time range pills */
+  .range-btn{background:#0f1117;color:#94a3b8;border:1px solid #2d3248;border-radius:4px;padding:4px 10px;font-size:.72rem;font-weight:600;cursor:pointer;transition:all 0.15s ease}
+  .range-btn:hover{color:#fff;border-color:#38bdf8}
+  .range-btn.active{background:#1e3a5f;color:#7dd3fc;border-color:#2d6a9f}
+
+  /* Tab pages */
+  .tab-pane{display:none}
+  .tab-pane.active{display:block}
 
   /* Status bar */
   .sbar{background:#1e2130;border:1px solid #2d3248;border-radius:8px;padding:10px 14px;
@@ -503,7 +547,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .mgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:16px}
   .metric{background:#1e2130;border:1px solid #2d3248;border-radius:8px;padding:12px}
   .metric .lbl{font-size:.7rem;color:#64748b;margin-bottom:4px}
-  .metric .val{font-size:1.4rem;font-weight:700;font-variant-numeric:tabular-nums}
+  .metric .val{font-size:1.35rem;font-weight:700;font-variant-numeric:tabular-nums}
   .metric .unit{font-size:.7rem;color:#64748b;margin-left:2px}
   .ok{color:#34d399}.warn{color:#fbbf24}.error{color:#f87171}.dim{color:#94a3b8}
 
@@ -511,18 +555,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .card{background:#1e2130;border:1px solid #2d3248;border-radius:8px;padding:16px;margin-bottom:16px}
   .chart-wrap{position:relative;height:190px}
   .two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-  @media(max-width:700px){.two-col{grid-template-columns:1fr}}
+  @media(max-width:850px){.two-col{grid-template-columns:1fr}}
 
   /* Tables */
   table{width:100%;border-collapse:collapse;font-size:.76rem}
-  th{text-align:left;color:#64748b;font-weight:500;padding:5px 8px;border-bottom:1px solid #2d3248}
-  td{padding:5px 8px;border-bottom:1px solid #1a1f2e;font-variant-numeric:tabular-nums}
+  th{text-align:left;color:#64748b;font-weight:500;padding:6px 8px;border-bottom:1px solid #2d3248}
+  td{padding:6px 8px;border-bottom:1px solid #1a1f2e;font-variant-numeric:tabular-nums}
   tr:last-child td{border-bottom:none}
   tr:hover td{background:#252a3a}
   .mono{font-family:monospace;font-size:.72rem}
 
   /* Badges */
-  .badge{display:inline-block;padding:1px 6px;border-radius:99px;font-size:.66rem;font-weight:600;white-space:nowrap}
+  .badge{display:inline-block;padding:2px 7px;border-radius:99px;font-size:.66rem;font-weight:600;white-space:nowrap}
   .b-err{background:#450a0a;color:#f87171}  .b-warn{background:#422006;color:#fbbf24}
   .b-ok{background:#052e16;color:#34d399}   .b-info{background:#0c1a2e;color:#7dd3fc}
   .b-wifi{background:#1a0c2e;color:#c4b5fd} .b-net{background:#0c1a1a;color:#6ee7b7}
@@ -545,6 +589,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   /* Progress bar for CPU/RAM */
   .pbar{height:4px;background:#2d3248;border-radius:2px;margin-top:4px}
   .pbar-fill{height:100%;border-radius:2px}
+
   /* Action buttons */
   .act-btn{background:#1e3a5f;color:#7dd3fc;border:1px solid #2d6a9f;border-radius:6px;padding:6px 14px;font-size:.78rem;font-weight:600;cursor:pointer;transition:all 0.15s ease}
   .act-btn:hover{background:#2563eb;color:#ffffff}
@@ -554,7 +599,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>&#x1F4E1; Network Observability Monitor</h1>
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:16px">
+  <h1 style="margin-bottom:0">&#x1F4E1; Network Observability Monitor</h1>
+  <div style="font-size:0.75rem;color:#64748b">Unified Windows Observability Suite</div>
+</div>
+
+<!-- Tab Navigation Bar -->
+<div class="nav-tabs">
+  <button class="nav-tab active" onclick="setTab('telemetry', this)">&#128202; Telemetry</button>
+  <button class="nav-tab" onclick="setTab('lan', this)">&#127760; LAN &amp; Devices</button>
+  <button class="nav-tab" onclick="setTab('wifi', this)">&#128246; Wi-Fi &amp; RF</button>
+  <button class="nav-tab" onclick="setTab('diagnostics', this)">&#128300; Diagnostics</button>
+  <button class="nav-tab" onclick="setTab('events', this)">&#128220; Events &amp; Export</button>
+  <button class="nav-tab" onclick="setTab('all', this)">&#128193; All Panels</button>
+</div>
 
 <!-- Status bar -->
 <div class="sbar">
@@ -562,78 +620,130 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <span id="statusText">Loading&hellip;</span>
   <div class="sbar-right">
     <span id="staleWarn" style="display:none;color:#f87171">&#9888; Monitor may be offline</span>
-    <span id="dbSize">DB: —</span>
-    <span id="sampleCount">Samples: —</span>
-    <span id="updated">—</span>
+    <span id="dbSize">DB: &mdash;</span>
+    <span id="sampleCount">Samples: &mdash;</span>
+    <span id="updated">&mdash;</span>
   </div>
 </div>
 
-<!-- Quick Actions Panel (Feature 1) -->
+<!-- Quick Actions Panel -->
 <div class="card" style="margin-bottom:16px">
   <h2>&#9889; On-Demand Actions</h2>
-  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-    <button class="act-btn" id="btnSpeed" onclick="triggerAction('speedtest', this)">&#128640; Run Speed Test</button>
-    <button class="act-btn" id="btnBloat" onclick="triggerAction('bufferbloat', this)">&#128200; Run Bufferbloat Test</button>
-    <button class="act-btn" id="btnScan" onclick="triggerAction('wifiscan', this)">&#128246; Scan Wi-Fi Now</button>
-    <button class="act-btn" id="btnDns" onclick="triggerAction('dns_benchmark', this)">&#127760; Benchmark DNS</button>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <button class="act-btn" id="btnSpeed" onclick="triggerAction('speedtest', this)">&#128640; Speed Test</button>
+    <button class="act-btn" id="btnBloat" onclick="triggerAction('bufferbloat', this)">&#128200; Bufferbloat</button>
+    <button class="act-btn" id="btnLanScan" onclick="triggerAction('lanscan', this)">&#127760; Scan LAN</button>
+    <button class="act-btn" id="btnMdnsScan" onclick="triggerAction('mdnsscan', this)">&#128251; Scan mDNS</button>
+    <button class="act-btn" id="btnMtuScan" onclick="triggerAction('mtuscan', this)">&#128207; Path MTU</button>
+    <button class="act-btn" id="btnScan" onclick="triggerAction('wifiscan', this)">&#128246; Scan Wi-Fi</button>
+    <button class="act-btn" id="btnDns" onclick="triggerAction('dns_benchmark', this)">&#128269; DNS Benchmark</button>
     <div style="display:flex;gap:4px;align-items:center;margin-left:auto">
-      <input id="traceTarget" type="text" placeholder="1.1.1.1" value="1.1.1.1" style="background:#0f1117;color:#e2e8f0;border:1px solid #2d3248;border-radius:4px;padding:6px 8px;font-size:.78rem;width:130px">
-      <button class="act-btn" onclick="triggerTraceroute(this)">&#128269; Traceroute</button>
+      <input id="traceTarget" type="text" placeholder="1.1.1.1" value="1.1.1.1" style="background:#0f1117;color:#e2e8f0;border:1px solid #2d3248;border-radius:4px;padding:6px 8px;font-size:.78rem;width:120px">
+      <button class="act-btn" onclick="triggerTraceroute(this)">&#127937; Traceroute</button>
     </div>
   </div>
   <div id="actionStatus" style="font-size:0.75rem;color:#7dd3fc;margin-top:10px;display:none"></div>
 </div>
 
-<!-- Metrics -->
-<div class="mgrid">
-  <div class="metric"><div class="lbl">Internet Ping</div>
-    <div><span class="val" id="mPing">--</span><span class="unit">ms</span></div></div>
-  <div class="metric"><div class="lbl">Gateway Ping</div>
-    <div><span class="val" id="mGw">--</span><span class="unit">ms</span></div></div>
-  <div class="metric"><div class="lbl">DNS Resolver</div>
-    <div><span class="val" id="mDns">--</span><span class="unit">ms</span></div></div>
-  <div class="metric"><div class="lbl">DNS Server (UDP)</div>
-    <div><span class="val" id="mDnsSrv">--</span><span class="unit">ms</span></div></div>
-  <div class="metric"><div class="lbl">HTTP Response</div>
-    <div><span class="val" id="mHttp">--</span><span class="unit">ms</span></div></div>
-  <div class="metric"><div class="lbl">Packet Loss</div>
-    <div><span class="val" id="mLoss">--</span><span class="unit">%</span></div></div>
-  <div class="metric"><div class="lbl">CPU</div>
-    <div><span class="val" id="mCpu">--</span><span class="unit">%</span></div>
-    <div class="pbar"><div class="pbar-fill" id="cpuBar" style="width:0%;background:#38bdf8"></div></div>
+<!-- ========================================================================= -->
+<!-- PANE: TELEMETRY -->
+<!-- ========================================================================= -->
+<div id="pane-telemetry" class="tab-pane active">
+  <!-- Metrics Grid -->
+  <div class="mgrid">
+    <div class="metric"><div class="lbl">Internet Ping</div>
+      <div><span class="val" id="mPing">--</span><span class="unit">ms</span></div></div>
+    <div class="metric"><div class="lbl">Gateway Ping</div>
+      <div><span class="val" id="mGw">--</span><span class="unit">ms</span></div></div>
+    <div class="metric"><div class="lbl">DNS Resolver</div>
+      <div><span class="val" id="mDns">--</span><span class="unit">ms</span></div></div>
+    <div class="metric"><div class="lbl">DNS Server (UDP)</div>
+      <div><span class="val" id="mDnsSrv">--</span><span class="unit">ms</span></div></div>
+    <div class="metric"><div class="lbl">HTTP Response</div>
+      <div><span class="val" id="mHttp">--</span><span class="unit">ms</span></div></div>
+    <div class="metric"><div class="lbl">Packet Loss</div>
+      <div><span class="val" id="mLoss">--</span><span class="unit">%</span></div></div>
+    <div class="metric"><div class="lbl">CPU</div>
+      <div><span class="val" id="mCpu">--</span><span class="unit">%</span></div>
+      <div class="pbar"><div class="pbar-fill" id="cpuBar" style="width:0%;background:#38bdf8"></div></div>
+    </div>
+    <div class="metric"><div class="lbl">RAM</div>
+      <div><span class="val" id="mRam">--</span><span class="unit">%</span></div>
+      <div class="pbar"><div class="pbar-fill" id="ramBar" style="width:0%;background:#818cf8"></div></div>
+    </div>
+    <div class="metric"><div class="lbl">Probe Duration</div>
+      <div><span class="val" id="mProbe">--</span><span class="unit">ms</span></div></div>
+    <div class="metric"><div class="lbl">Probed Host</div>
+      <div class="val dim" id="mHost" style="font-size:.8rem;margin-top:3px">--</div></div>
+    <div class="metric"><div class="lbl">IP Address</div>
+      <div class="val dim" id="mIp" style="font-size:.8rem;margin-top:3px">--</div></div>
+    <div class="metric"><div class="lbl">DNS Server</div>
+      <div class="val dim" id="mDnsSrvIp" style="font-size:.8rem;margin-top:3px">--</div></div>
+    <div class="metric" style="grid-column:span 2">
+      <div class="lbl">Active Interface</div>
+      <div class="val dim" id="mActiveIface" style="font-size:.85rem;margin-top:3px">--</div>
+    </div>
   </div>
-  <div class="metric"><div class="lbl">RAM</div>
-    <div><span class="val" id="mRam">--</span><span class="unit">%</span></div>
-    <div class="pbar"><div class="pbar-fill" id="ramBar" style="width:0%;background:#818cf8"></div></div>
+
+  <!-- Time Range Selector -->
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;margin-top:8px">
+    <div style="font-size:0.75rem;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.05em">&#128337; History Range:</div>
+    <div style="display:flex;gap:4px">
+      <button class="range-btn active" onclick="setTimeRange(300, this)">5m</button>
+      <button class="range-btn" onclick="setTimeRange(900, this)">15m</button>
+      <button class="range-btn" onclick="setTimeRange(3600, this)">1h</button>
+      <button class="range-btn" onclick="setTimeRange(21600, this)">6h</button>
+      <button class="range-btn" onclick="setTimeRange(86400, this)">24h</button>
+    </div>
   </div>
-  <div class="metric"><div class="lbl">Probe Duration</div>
-    <div><span class="val" id="mProbe">--</span><span class="unit">ms</span></div></div>
-  <div class="metric"><div class="lbl">Probed Host</div>
-    <div class="val dim" id="mHost" style="font-size:.8rem;margin-top:3px">--</div></div>
-  <div class="metric"><div class="lbl">IP Address</div>
-    <div class="val dim" id="mIp" style="font-size:.8rem;margin-top:3px">--</div></div>
-  <div class="metric"><div class="lbl">DNS Server</div>
-    <div class="val dim" id="mDnsSrvIp" style="font-size:.8rem;margin-top:3px">--</div></div>
-  <div class="metric" style="grid-column:span 2">
-    <div class="lbl">Active Interface</div>
-    <div class="val dim" id="mActiveIface" style="font-size:.85rem;margin-top:3px">--</div>
+
+  <!-- Latency + DNS/HTTP -->
+  <div class="two-col">
+    <div class="card"><h2>Latency History</h2>
+      <div class="chart-wrap"><canvas id="cLatency"></canvas></div></div>
+    <div class="card"><h2>DNS &amp; HTTP</h2>
+      <div class="chart-wrap"><canvas id="cDnsHttp"></canvas></div></div>
+  </div>
+
+  <!-- DNS comparison + Packet loss -->
+  <div class="two-col">
+    <div class="card"><h2>DNS Resolver vs Server (UDP)</h2>
+      <div class="chart-wrap"><canvas id="cDnsCmp"></canvas></div></div>
+    <div class="card"><h2>Packet Loss Rate</h2>
+      <div class="chart-wrap"><canvas id="cLoss"></canvas></div></div>
+  </div>
+
+  <!-- CPU/RAM + Interface activity timeline -->
+  <div class="two-col">
+    <div class="card"><h2>CPU &amp; RAM</h2>
+      <div class="chart-wrap"><canvas id="cSys"></canvas></div></div>
+    <div class="card">
+      <h2>Interface Activity Timeline <span id="ifaceNote" style="font-weight:400;color:#475569;text-transform:none;font-size:0.72rem;margin-left:8px"></span></h2>
+      <div class="chart-wrap"><canvas id="cIfaceTimeline"></canvas></div>
+      <div id="ifaceList" style="margin-top:10px;display:flex;gap:12px;flex-wrap:wrap;font-size:.74rem"></div>
+    </div>
+  </div>
+
+  <!-- NIC throughput + NIC errors -->
+  <div class="two-col">
+    <div class="card"><h2>NIC Throughput (Active Adapters)</h2>
+      <div class="chart-wrap"><canvas id="cNic"></canvas></div></div>
+    <div class="card"><h2>NIC Errors &amp; Drops</h2>
+      <div class="chart-wrap"><canvas id="cNicErr"></canvas></div></div>
+  </div>
+
+  <!-- TCP states -->
+  <div class="card">
+    <h2>TCP Connection States (Current)</h2>
+    <div class="chart-wrap" style="height:140px"><canvas id="cTcp"></canvas></div>
   </div>
 </div>
 
-<p class="note">Auto-refreshes every 5 s</p>
-
-<!-- Multi-DNS Benchmark (Feature 6) & Network Hogs (Feature 3) -->
-<div class="two-col">
-  <div class="card">
-    <h2>&#127760; Multi-DNS Latency Benchmark <span id="dnsBenchFastest" class="badge b-ok" style="margin-left:8px"></span></h2>
-    <div class="mgrid" style="grid-template-columns:repeat(auto-fit,minmax(110px,1fr));margin-bottom:8px">
-      <div class="metric"><div class="lbl">Local ISP DNS</div><div><span class="val" id="dLocal">--</span><span class="unit">ms</span></div></div>
-      <div class="metric"><div class="lbl">Cloudflare (1.1.1.1)</div><div><span class="val" id="dCf">--</span><span class="unit">ms</span></div></div>
-      <div class="metric"><div class="lbl">Google (8.8.8.8)</div><div><span class="val" id="dGoog">--</span><span class="unit">ms</span></div></div>
-      <div class="metric"><div class="lbl">Quad9 (9.9.9.9)</div><div><span class="val" id="dQuad">--</span><span class="unit">ms</span></div></div>
-    </div>
-    <div id="dnsRecommendation" style="font-size:0.75rem;color:#7dd3fc;margin-top:6px"></div>
-  </div>
+<!-- ========================================================================= -->
+<!-- PANE: LAN & DEVICES -->
+<!-- ========================================================================= -->
+<div id="pane-lan" class="tab-pane">
+  <!-- Network Hogs -->
   <div class="card">
     <h2>&#128187; Top Network Applications (Network Hogs)</h2>
     <table>
@@ -641,172 +751,220 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <tbody id="tProcesses"><tr><td colspan="5" class="dim">Sampling processes&hellip;</td></tr></tbody>
     </table>
   </div>
-</div>
 
-<!-- Latency + DNS/HTTP -->
-<div class="two-col">
-  <div class="card"><h2>Latency History</h2>
-    <div class="chart-wrap"><canvas id="cLatency"></canvas></div></div>
-  <div class="card"><h2>DNS &amp; HTTP</h2>
-    <div class="chart-wrap"><canvas id="cDnsHttp"></canvas></div></div>
-</div>
+  <!-- LAN ARP Neighbor Devices -->
+  <div class="card">
+    <h2>&#127760; LAN ARP Neighbor Devices <span id="lanCount" class="badge b-info" style="margin-left:8px">Scanning...</span></h2>
+    <table>
+      <thead>
+        <tr>
+          <th>IP Address</th>
+          <th>MAC Address</th>
+          <th>Vendor / Manufacturer</th>
+          <th>Adapter Interface</th>
+          <th>Device Type</th>
+          <th>Last Seen</th>
+        </tr>
+      </thead>
+      <tbody id="tLan"><tr><td colspan="6" class="dim">Loading LAN neighbor table&hellip;</td></tr></tbody>
+    </table>
+  </div>
 
-<!-- DNS comparison + Packet loss -->
-<div class="two-col">
-  <div class="card"><h2>DNS Resolver vs Server (UDP)</h2>
-    <div class="chart-wrap"><canvas id="cDnsCmp"></canvas></div></div>
-  <div class="card"><h2>Packet Loss Rate</h2>
-    <div class="chart-wrap"><canvas id="cLoss"></canvas></div></div>
-</div>
-
-<!-- CPU/RAM + Wi-Fi signal -->
-<div class="two-col">
-  <div class="card"><h2>CPU &amp; RAM</h2>
-    <div class="chart-wrap"><canvas id="cSys"></canvas></div></div>
-  <div class="card"><h2>Wi-Fi Signal</h2>
-    <div class="chart-wrap"><canvas id="cWifi"></canvas></div></div>
-</div>
-
-<!-- Wi-Fi live panel -->
-<div class="card">
-  <h2>Wi-Fi</h2>
-  <div style="display:flex;gap:20px;flex-wrap:wrap">
-    <div><div class="lbl">SSID</div><div class="val dim" id="wSSID" style="font-size:.95rem">--</div></div>
-    <div><div class="lbl">BSSID</div><div class="val dim mono" id="wBSSID" style="font-size:.8rem;margin-top:3px">--</div></div>
-    <div style="min-width:120px">
-      <div class="lbl">Signal</div>
-      <div class="val dim" id="wSignal" style="font-size:.95rem">--%</div>
-      <div class="sig-bar"><div class="sig-fill" id="wSigFill" style="width:0%"></div></div>
-    </div>
-    <div><div class="lbl">Band / Ch</div><div class="val dim" id="wBand" style="font-size:.85rem;margin-top:3px">--</div></div>
-    <div><div class="lbl">Rx / Tx</div><div class="val dim" id="wRates" style="font-size:.82rem;margin-top:3px">--</div></div>
-    <div><div class="lbl">Auth</div><div class="val dim" id="wAuth" style="font-size:.8rem;margin-top:3px">--</div></div>
+  <!-- mDNS / Bonjour / ZeroConf Devices -->
+  <div class="card">
+    <h2>&#128251; Discovered mDNS / Bonjour / ZeroConf Devices <span id="mdnsCount" class="badge b-info" style="margin-left:8px">Listening...</span></h2>
+    <table>
+      <thead>
+        <tr>
+          <th>IP Address</th>
+          <th>Hostname (.local)</th>
+          <th>Advertised Services / Device Info</th>
+          <th>Last Seen</th>
+        </tr>
+      </thead>
+      <tbody id="tMdns"><tr><td colspan="4" class="dim">Listening for mDNS multicast broadcasts (224.0.0.251:5353)&hellip;</td></tr></tbody>
+    </table>
   </div>
 </div>
 
-<!-- Interface activity timeline -->
-<div class="card">
-  <h2>Interface Activity <span id="ifaceNote" style="font-weight:400;color:#475569;text-transform:none;font-size:0.72rem"></span></h2>
-  <div class="chart-wrap" style="height:200px"><canvas id="cIfaceTimeline"></canvas></div>
-  <div id="ifaceList" style="margin-top:12px;display:flex;gap:16px;flex-wrap:wrap;font-size:.76rem"></div>
-</div>
-
-<!-- NIC throughput + NIC errors (datasets built dynamically per adapter) -->
-<div class="two-col">
-  <div class="card"><h2>NIC Throughput</h2>
-    <div class="chart-wrap"><canvas id="cNic"></canvas></div></div>
-  <div class="card"><h2>NIC Errors &amp; Drops</h2>
-    <div class="chart-wrap"><canvas id="cNicErr"></canvas></div></div>
-</div>
-
-<!-- Bufferbloat -->
-<div class="card">
-  <h2>Bufferbloat History</h2>
-  <table>
-    <thead><tr><th>Time</th><th>Rating</th><th>Baseline</th><th>Loaded</th><th>Delta</th><th>Download</th><th>Host</th></tr></thead>
-    <tbody id="tBloat"><tr><td colspan="7" class="dim">Waiting for first scan (runs every 5 min)&hellip;</td></tr></tbody>
-  </table>
-</div>
-
-<!-- Speed test -->
-<div class="card">
-  <h2>Speed Test History <span id="speedAge" style="font-weight:400;color:#475569;text-transform:none;font-size:0.72rem"></span></h2>
-  <div class="two-col" style="margin-bottom:14px">
-    <div class="chart-wrap" style="height:160px"><canvas id="cSpeedDl"></canvas></div>
-    <div class="chart-wrap" style="height:160px"><canvas id="cSpeedUl"></canvas></div>
+<!-- ========================================================================= -->
+<!-- PANE: WI-FI & RF -->
+<!-- ========================================================================= -->
+<div id="pane-wifi" class="tab-pane">
+  <!-- Wi-Fi live panel -->
+  <div class="card">
+    <h2>Wi-Fi Current Link</h2>
+    <div style="display:flex;gap:20px;flex-wrap:wrap">
+      <div><div class="lbl">SSID</div><div class="val dim" id="wSSID" style="font-size:.95rem">--</div></div>
+      <div><div class="lbl">BSSID</div><div class="val dim mono" id="wBSSID" style="font-size:.8rem;margin-top:3px">--</div></div>
+      <div style="min-width:120px">
+        <div class="lbl">Signal</div>
+        <div class="val dim" id="wSignal" style="font-size:.95rem">--%</div>
+        <div class="sig-bar"><div class="sig-fill" id="wSigFill" style="width:0%"></div></div>
+      </div>
+      <div><div class="lbl">Band / Ch</div><div class="val dim" id="wBand" style="font-size:.85rem;margin-top:3px">--</div></div>
+      <div><div class="lbl">Rx / Tx</div><div class="val dim" id="wRates" style="font-size:.82rem;margin-top:3px">--</div></div>
+      <div><div class="lbl">Auth</div><div class="val dim" id="wAuth" style="font-size:.8rem;margin-top:3px">--</div></div>
+    </div>
   </div>
-  <table>
-    <thead><tr><th>Time</th><th>Download</th><th>Upload</th><th>Duration</th></tr></thead>
-    <tbody id="tSpeed"><tr><td colspan="4" class="dim">Waiting for first test (runs every 15 min)&hellip;</td></tr></tbody>
-  </table>
-</div>
 
-<!-- Export -->
-<div class="card">
-  <h2>Export Data</h2>
-  <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">
-    <div>
-      <div class="lbl" style="margin-bottom:4px">Table</div>
-      <select id="expTable" style="background:#0f1117;color:#e2e8f0;border:1px solid #2d3248;border-radius:4px;padding:4px 8px;font-size:.8rem">
-        <option>samples</option><option>events</option><option>wifi_samples</option>
-        <option>nic_samples</option><option>tcp_states</option>
-        <option>wifi_scan_results</option><option>bufferbloat_samples</option>
-        <option>speed_test_results</option><option>action_queue</option><option>process_samples</option><option>dns_benchmarks</option>
-      </select>
+  <!-- Wi-Fi signal chart -->
+  <div class="card">
+    <h2>Wi-Fi Signal History</h2>
+    <div class="chart-wrap"><canvas id="cWifi"></canvas></div>
+  </div>
+
+  <!-- Wi-Fi Channel Overlap & Congestion -->
+  <div class="card">
+    <h2>&#128246; Wi-Fi Channel Overlap &amp; Congestion <span id="wifiChanRec" class="badge b-ok" style="margin-left:8px"></span></h2>
+    <div class="two-col" style="margin-top:10px">
+      <div>
+        <h3 style="font-size:.72rem;color:#94a3b8;margin-bottom:6px">2.4 GHz Spectrum (Channels 1&ndash;13)</h3>
+        <div class="chart-wrap" style="height:150px"><canvas id="cChan24"></canvas></div>
+      </div>
+      <div>
+        <h3 style="font-size:.72rem;color:#94a3b8;margin-bottom:6px">5 GHz Spectrum Channels</h3>
+        <div class="chart-wrap" style="height:150px"><canvas id="cChan5"></canvas></div>
+      </div>
     </div>
-    <div>
-      <div class="lbl" style="margin-bottom:4px">From</div>
-      <input id="expFrom" type="datetime-local" style="background:#0f1117;color:#e2e8f0;border:1px solid #2d3248;border-radius:4px;padding:4px 8px;font-size:.8rem">
-    </div>
-    <div>
-      <div class="lbl" style="margin-bottom:4px">To</div>
-      <input id="expTo" type="datetime-local" style="background:#0f1117;color:#e2e8f0;border:1px solid #2d3248;border-radius:4px;padding:4px 8px;font-size:.8rem">
-    </div>
-    <div>
-      <div class="lbl" style="margin-bottom:4px">Format</div>
-      <select id="expFmt" style="background:#0f1117;color:#e2e8f0;border:1px solid #2d3248;border-radius:4px;padding:4px 8px;font-size:.8rem">
-        <option value="csv">CSV</option><option value="json">JSON</option>
-      </select>
-    </div>
-    <button onclick="doExport()" style="background:#1e3a5f;color:#7dd3fc;border:1px solid #2d6a9f;border-radius:4px;padding:6px 14px;font-size:.8rem;cursor:pointer">
-      Download
-    </button>
+  </div>
+
+  <!-- Wi-Fi environment scan -->
+  <div class="card">
+    <h2>Wi-Fi Environment Scan <span id="scanAge" style="font-weight:400;color:#475569;text-transform:none;font-size:0.72rem;margin-left:8px"></span></h2>
+    <table>
+      <thead>
+        <tr>
+          <th>SSID</th>
+          <th>BSSID</th>
+          <th>Signal</th>
+          <th>Ch</th>
+          <th>Band</th>
+          <th>Auth</th>
+          <th>Cipher</th>
+        </tr>
+      </thead>
+      <tbody id="tScan"><tr><td colspan="7" class="dim">Waiting for first scan&hellip;</td></tr></tbody>
+    </table>
   </div>
 </div>
 
-<!-- TCP states -->
-<div class="card"><h2>TCP Connection States (current)</h2>
-  <div class="chart-wrap" style="height:140px"><canvas id="cTcp"></canvas></div></div>
+<!-- ========================================================================= -->
+<!-- PANE: DIAGNOSTICS -->
+<!-- ========================================================================= -->
+<div id="pane-diagnostics" class="tab-pane">
+  <!-- Multi-DNS Benchmark -->
+  <div class="card">
+    <h2>&#127760; Multi-DNS Latency Benchmark <span id="dnsBenchFastest" class="badge b-ok" style="margin-left:8px"></span></h2>
+    <div class="mgrid" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));margin-bottom:8px">
+      <div class="metric"><div class="lbl">Local ISP DNS</div><div><span class="val" id="dLocal">--</span><span class="unit">ms</span></div></div>
+      <div class="metric"><div class="lbl">Cloudflare (1.1.1.1)</div><div><span class="val" id="dCf">--</span><span class="unit">ms</span></div></div>
+      <div class="metric"><div class="lbl">Google (8.8.8.8)</div><div><span class="val" id="dGoog">--</span><span class="unit">ms</span></div></div>
+      <div class="metric"><div class="lbl">Quad9 (9.9.9.9)</div><div><span class="val" id="dQuad">--</span><span class="unit">ms</span></div></div>
+    </div>
+    <div id="dnsRecommendation" style="font-size:0.75rem;color:#7dd3fc;margin-top:6px"></div>
+  </div>
 
-<!-- Wi-Fi Channel Overlap & Congestion (Feature 7) -->
-<div class="card">
-  <h2>&#128246; Wi-Fi Channel Overlap &amp; Congestion <span id="wifiChanRec" class="badge b-ok" style="margin-left:8px"></span></h2>
-  <div class="two-col" style="margin-top:10px">
-    <div>
-      <h3 style="font-size:.72rem;color:#94a3b8;margin-bottom:6px">2.4 GHz Spectrum (Channels 1–13)</h3>
-      <div class="chart-wrap" style="height:150px"><canvas id="cChan24"></canvas></div>
+  <!-- Path MTU & Gateway Diagnostics -->
+  <div class="card">
+    <h2>&#128207; Path MTU &amp; Packet Fragmentation Diagnostics</h2>
+    <div class="mgrid" style="grid-template-columns:repeat(auto-fit,minmax(130px,1fr));margin-bottom:12px">
+      <div class="metric"><div class="lbl">Probed Target</div><div class="val dim" id="mtuTarget" style="font-size:1.1rem">--</div></div>
+      <div class="metric"><div class="lbl">Path MTU</div><div><span class="val" id="mtuVal">--</span><span class="unit">bytes</span></div></div>
+      <div class="metric"><div class="lbl">Max ICMP Payload</div><div><span class="val" id="mtuPayload">--</span><span class="unit">bytes</span></div></div>
+      <div class="metric"><div class="lbl">Fragmentation</div><div class="val" id="mtuFrag" style="font-size:1.1rem">--</div></div>
+      <div class="metric" style="grid-column:span 2"><div class="lbl">Diagnostic Analysis</div><div class="val dim" id="mtuNotes" style="font-size:.82rem;margin-top:2px">--</div></div>
     </div>
-    <div>
-      <h3 style="font-size:.72rem;color:#94a3b8;margin-bottom:6px">5 GHz Spectrum Channels</h3>
-      <div class="chart-wrap" style="height:150px"><canvas id="cChan5"></canvas></div>
+    <table>
+      <thead><tr><th>Time</th><th>Target Host</th><th>Path MTU</th><th>Payload</th><th>Status</th><th>Diagnostic Notes</th></tr></thead>
+      <tbody id="tMtu"><tr><td colspan="6" class="dim">Run MTU probe via On-Demand Actions or wait for schedule&hellip;</td></tr></tbody>
+    </table>
+  </div>
+
+  <!-- Bufferbloat -->
+  <div class="card">
+    <h2>Bufferbloat History</h2>
+    <table>
+      <thead><tr><th>Time</th><th>Rating</th><th>Baseline</th><th>Loaded</th><th>Delta</th><th>Download</th><th>Host</th></tr></thead>
+      <tbody id="tBloat"><tr><td colspan="7" class="dim">Waiting for first scan (runs every 5 min)&hellip;</td></tr></tbody>
+    </table>
+  </div>
+
+  <!-- Speed test -->
+  <div class="card">
+    <h2>Speed Test History <span id="speedAge" style="font-weight:400;color:#475569;text-transform:none;font-size:0.72rem;margin-left:8px"></span></h2>
+    <div class="two-col" style="margin-bottom:14px">
+      <div class="chart-wrap" style="height:160px"><canvas id="cSpeedDl"></canvas></div>
+      <div class="chart-wrap" style="height:160px"><canvas id="cSpeedUl"></canvas></div>
     </div>
+    <table>
+      <thead><tr><th>Time</th><th>Download</th><th>Upload</th><th>Duration</th></tr></thead>
+      <tbody id="tSpeed"><tr><td colspan="4" class="dim">Waiting for first test (runs every 15 min)&hellip;</td></tr></tbody>
+    </table>
   </div>
 </div>
 
-<!-- Wi-Fi environment scan -->
-<div class="card">
-  <h2>Wi-Fi Environment Scan <span id="scanAge" style="font-weight:400;color:#475569;text-transform:none;font-size:0.72rem"></span></h2>
-  <table>
-    <thead>
-      <tr>
-        <th>SSID</th>
-        <th>BSSID</th>
-        <th>Signal</th>
-        <th>Ch</th>
-        <th>Band</th>
-        <th>Auth</th>
-        <th>Cipher</th>
-      </tr>
-    </thead>
-    <tbody id="tScan"><tr><td colspan="7" class="dim">Waiting for first scan&hellip;</td></tr></tbody>
-  </table>
-</div>
-
-<!-- Events + Incidents -->
-<div class="two-col">
-  <div class="card"><h2>Events</h2>
-    <table><thead><tr><th>Time</th><th>Cat</th><th>Message</th></tr></thead>
-    <tbody id="tEvents"><tr><td colspan="3" class="dim">Loading&hellip;</td></tr></tbody></table>
+<!-- ========================================================================= -->
+<!-- PANE: EVENTS & EXPORT -->
+<!-- ========================================================================= -->
+<div id="pane-events" class="tab-pane">
+  <!-- Events + Incidents -->
+  <div class="two-col">
+    <div class="card"><h2>Recent Events</h2>
+      <table><thead><tr><th>Time</th><th>Cat</th><th>Message</th></tr></thead>
+      <tbody id="tEvents"><tr><td colspan="3" class="dim">Loading&hellip;</td></tr></tbody></table>
+    </div>
+    <div class="card"><h2>Diagnostic Incidents</h2>
+      <table><thead><tr><th>File</th><th>Size</th><th>Time</th></tr></thead>
+      <tbody id="tIncidents"><tr><td colspan="3" class="dim">Loading&hellip;</td></tr></tbody></table>
+    </div>
   </div>
-  <div class="card"><h2>Incidents</h2>
-    <table><thead><tr><th>File</th><th>Size</th><th>Time</th></tr></thead>
-    <tbody id="tIncidents"><tr><td colspan="3" class="dim">Loading&hellip;</td></tr></tbody></table>
+
+  <!-- Export Data -->
+  <div class="card">
+    <h2>Export Telemetry &amp; Discovery Data</h2>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">
+      <div>
+        <div class="lbl" style="margin-bottom:4px">Table</div>
+        <select id="expTable" style="background:#0f1117;color:#e2e8f0;border:1px solid #2d3248;border-radius:4px;padding:5px 8px;font-size:.8rem">
+          <option value="samples">samples (Core telemetry)</option>
+          <option value="lan_devices">lan_devices (ARP Neighbors)</option>
+          <option value="mdns_devices">mdns_devices (mDNS ZeroConf)</option>
+          <option value="mtu_samples">mtu_samples (Path MTU)</option>
+          <option value="process_samples">process_samples (Network Hogs)</option>
+          <option value="dns_benchmarks">dns_benchmarks (Multi-DNS)</option>
+          <option value="wifi_samples">wifi_samples (Wi-Fi Link)</option>
+          <option value="wifi_scan_results">wifi_scan_results (RF Scan)</option>
+          <option value="nic_samples">nic_samples (NIC Throughput)</option>
+          <option value="tcp_states">tcp_states (TCP Connections)</option>
+          <option value="bufferbloat_samples">bufferbloat_samples</option>
+          <option value="speed_test_results">speed_test_results</option>
+          <option value="events">events</option>
+          <option value="action_queue">action_queue</option>
+        </select>
+      </div>
+      <div>
+        <div class="lbl" style="margin-bottom:4px">From</div>
+        <input id="expFrom" type="datetime-local" style="background:#0f1117;color:#e2e8f0;border:1px solid #2d3248;border-radius:4px;padding:5px 8px;font-size:.8rem">
+      </div>
+      <div>
+        <div class="lbl" style="margin-bottom:4px">To</div>
+        <input id="expTo" type="datetime-local" style="background:#0f1117;color:#e2e8f0;border:1px solid #2d3248;border-radius:4px;padding:5px 8px;font-size:.8rem">
+      </div>
+      <div>
+        <div class="lbl" style="margin-bottom:4px">Format</div>
+        <select id="expFmt" style="background:#0f1117;color:#e2e8f0;border:1px solid #2d3248;border-radius:4px;padding:5px 8px;font-size:.8rem">
+          <option value="csv">CSV</option><option value="json">JSON</option>
+        </select>
+      </div>
+      <button onclick="doExport()" class="act-btn">Download</button>
+    </div>
   </div>
 </div>
 
 <script>
 // ---------------------------------------------------------------------------
-// Chart factory
+// Chart Factory & Global Settings
 // ---------------------------------------------------------------------------
 const G = { text:'#94a3b8', grid:'#1a1f2e' };
 
@@ -851,21 +1009,14 @@ const cChan5   = new Chart(document.getElementById('cChan5').getContext('2d'), {
   options:{ responsive:true, maintainAspectRatio:false, animation:false, plugins:{ legend:{ display:false } }, scales:{ x:{ ticks:{ color:G.text, font:{size:9} }, grid:{ color:G.grid } }, y:{ ticks:{ color:G.text, stepSize:1, font:{size:9} }, grid:{ color:G.grid }, beginAtZero:true } } },
 });
 
-// NIC charts are initialised empty; datasets are added dynamically as new
-// interface names are discovered. This handles any number of NICs and Wi-Fi
-// adapters without hardcoding dataset indices.
 const cNic    = mkChart('cNic',    [], 'KB/s');
 const cNicErr = mkChart('cNicErr', [], '/s');
-
-// Interface activity timeline -- one line per active interface.
 const cIfaceTimeline = mkChart('cIfaceTimeline', [], 'KB/s');
 
-// Colour palette for NIC adapter datasets. Cycles if more than palette length.
 const NIC_COLOURS = [
   'rgb(52,211,153)', 'rgb(251,191,36)', 'rgb(56,189,248)',
   'rgb(248,113,113)','rgb(167,139,250)','rgb(251,146,60)',
 ];
-// Track which interface names have been added to each NIC chart.
 const nicThroughputAdapters = new Set();
 const nicErrorAdapters      = new Set();
 
@@ -874,9 +1025,7 @@ function ensureNicDataset(chart, adapterSet, iface, suffix) {
   adapterSet.add(iface);
   const idx = adapterSet.size - 1;
   const colour = NIC_COLOURS[idx % NIC_COLOURS.length];
-  chart.data.datasets.push(
-    ds(`${iface} ${suffix}`, colour)
-  );
+  chart.data.datasets.push(ds(`${iface} ${suffix}`, colour));
   chart.data.datasets[chart.data.datasets.length - 1].data = [];
 }
 
@@ -914,14 +1063,6 @@ function lossCls(p) { return !p?'ok':p>10?'error':p>2?'warn':'ok'; }
 function sysCls(p)  { return p>90?'error':p>70?'warn':'ok'; }
 function probeCls(ms, interval) { return ms > interval*1000*0.8 ? 'warn' : 'ok'; }
 
-function notesHtml(notes) {
-  if (!notes) return '<span class="badge b-ok">healthy</span>';
-  return notes.split(',').map(n => {
-    const t=n.trim();
-    const c=(t==='packet_loss'||t==='severe_latency')?'b-err':'b-warn';
-    return `<span class="badge ${c}">${t}</span>`;
-  }).join(' ');
-}
 function catBadge(cat) {
   return `<span class="badge ${{fault:'b-err',wifi:'b-wifi',network:'b-net',system:'b-sys',info:'b-info'}[cat]||'b-info'}">${cat}</span>`;
 }
@@ -936,10 +1077,37 @@ function upd(chart, labels, ...series) {
 }
 
 // ---------------------------------------------------------------------------
-// Stale detection -- warn if last sample is > 15 s old
+// Tab Switching & Time-Range Controls
+// ---------------------------------------------------------------------------
+let currentHistoryN = 300;
+
+function setTab(name, btn) {
+  document.querySelectorAll('.nav-tab').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  const panes = document.querySelectorAll('.tab-pane');
+  if (name === 'all') {
+    panes.forEach(p => p.style.display = 'block');
+  } else {
+    panes.forEach(p => {
+      p.style.display = (p.id === 'pane-' + name) ? 'block' : 'none';
+    });
+  }
+}
+
+function setTimeRange(n, btn) {
+  document.querySelectorAll('.range-btn').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  currentHistoryN = n;
+  updateHistory();
+  updateWifi();
+  updateNic();
+  updateIfaceTimeline();
+}
+
+// ---------------------------------------------------------------------------
+// Stale Detection
 // ---------------------------------------------------------------------------
 let lastSampleTs = null;
-
 function checkStale() {
   if (!lastSampleTs) return;
   const age = (Date.now() - new Date(lastSampleTs).getTime()) / 1000;
@@ -956,21 +1124,18 @@ function checkStale() {
 }
 setInterval(checkStale, 5000);
 
-// ---------------------------------------------------------------------------
-// Interval hint for probe duration colouring (fetched from status)
-// ---------------------------------------------------------------------------
 let pollInterval = 1.0;
 
 // ---------------------------------------------------------------------------
-// Fetch and render
+// Telemetry & Metrics
 // ---------------------------------------------------------------------------
 async function updateStatus() {
   const r = await fetch('/api/status').catch(()=>null);
   if (!r?.ok) return;
   const d = await r.json();
   const mb = (d.db_size_bytes/1048576).toFixed(1);
-  document.getElementById('dbSize').textContent        = `DB: ${mb} MB`;
-  document.getElementById('sampleCount').textContent   = `Samples: ${d.sample_count.toLocaleString()}`;
+  document.getElementById('dbSize').textContent      = `DB: ${mb} MB`;
+  document.getElementById('sampleCount').textContent = `Samples: ${d.sample_count.toLocaleString()}`;
   if (d.last_sample) lastSampleTs = d.last_sample;
 }
 
@@ -1003,17 +1168,16 @@ async function updateLatest() {
 
   const status = statusFrom(d.notes);
   const dot = document.getElementById('dot');
-  // Only update dot if monitor is not already stale.
   if (!document.getElementById('staleWarn').style.display || document.getElementById('staleWarn').style.display === 'none') {
     dot.className = `dot ${status}`;
     document.getElementById('statusText').textContent =
-      d.notes ? `Fault: ${d.notes}` : 'All metrics within bounds';
+      d.notes ? `Fault: ${d.notes}` : 'All network metrics within nominal thresholds';
   }
   document.getElementById('updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
 }
 
 async function updateHistory() {
-  const r = await fetch('/api/history?n=300').catch(()=>null);
+  const r = await fetch(`/api/history?n=${currentHistoryN}`).catch(()=>null);
   if (!r?.ok) return;
   const rows = await r.json();
   const lbl = rows.map(r => ts(r.timestamp));
@@ -1024,8 +1188,11 @@ async function updateHistory() {
   upd(cSys,     lbl, rows.map(r=>r.cpu_pct),       rows.map(r=>r.ram_pct));
 }
 
+// ---------------------------------------------------------------------------
+// Wi-Fi Updates
+// ---------------------------------------------------------------------------
 async function updateWifi() {
-  const r = await fetch('/api/wifi?n=300').catch(()=>null);
+  const r = await fetch(`/api/wifi?n=${currentHistoryN}`).catch(()=>null);
   if (!r?.ok) return;
   const rows = await r.json();
   if (!rows.length) return;
@@ -1042,120 +1209,23 @@ async function updateWifi() {
   document.getElementById('wAuth').textContent  = w.auth || '—';
 }
 
-async function updateNic() {
-  const r = await fetch('/api/nic?n=300').catch(()=>null);
+async function updateWifiChannels() {
+  const r = await fetch('/api/wifi_channels').catch(()=>null);
   if (!r?.ok) return;
-  const rows = await r.json();
-  if (!rows.length) return;
-
-  // Only show adapters that have carried meaningful traffic (peak > 1 KB/s).
-  // This suppresses Hyper-V virtual adapters and idle Wi-Fi from cluttering
-  // the throughput chart while keeping them in the timeline.
-  const allIfaces = [...new Set(rows.map(r => r.interface))];
-  const activeIfaces = allIfaces.filter(iface => {
-    const ifRows = rows.filter(r => r.interface === iface);
-    const peak = Math.max(...ifRows.map(r => (r.bytes_recv_ps||0)+(r.bytes_sent_ps||0)));
-    return peak > 1024;
-  });
-
-  if (!activeIfaces.length) return;
-
-  const labels = rows
-    .filter(r => r.interface === activeIfaces[0])
-    .map(r => ts(r.timestamp));
-
-  activeIfaces.forEach(iface => {
-    ensureNicDataset(cNic,    nicThroughputAdapters, iface, 'KB/s');
-    ensureNicDataset(cNicErr, nicErrorAdapters,      iface, 'err/s');
-  });
-
-  cNic.data.labels    = labels;
-  cNicErr.data.labels = labels;
-
-  const ifaceArr = [...nicThroughputAdapters];
-  ifaceArr.forEach((iface, i) => {
-    const ifRows = rows.filter(r => r.interface === iface);
-    cNic.data.datasets[i].data =
-      ifRows.map(r => kb((r.bytes_recv_ps||0) + (r.bytes_sent_ps||0)));
-    cNicErr.data.datasets[i].data =
-      ifRows.map(r => (r.errin_ps||0)+(r.errout_ps||0)+
-                      (r.dropin_ps||0)+(r.dropout_ps||0));
-  });
-
-  cNic.update('none');
-  cNicErr.update('none');
-}
-
-async function updateTcp() {
-  const r = await fetch('/api/tcp?n=1').catch(()=>null);
-  if (!r?.ok) return;
-  const rows = await r.json();
-  if (!rows.length) return;
-  const t = rows[rows.length-1];
-  cTcp.data.datasets[0].data = [t.established||0];
-  cTcp.data.datasets[1].data = [t.time_wait||0];
-  cTcp.data.datasets[2].data = [t.close_wait||0];
-  cTcp.data.datasets[3].data = [t.listen||0];
-  cTcp.data.datasets[4].data = [(t.syn_sent||0)+(t.syn_recv||0)+(t.fin_wait1||0)+
-    (t.fin_wait2||0)+(t.closing||0)+(t.last_ack||0)+(t.other||0)];
-  cTcp.update('none');
-}
-
-async function updateEvents() {
-  const r = await fetch('/api/events?n=100').catch(()=>null);
-  if (!r?.ok) return;
-  const rows = await r.json();
-  const tb = document.getElementById('tEvents');
-  if (!rows.length) { tb.innerHTML='<tr><td colspan="3" class="dim">No events yet</td></tr>'; return; }
-  tb.innerHTML = rows.map(e => {
-    const isErr = e.message.includes('packet_loss')||e.message.includes('severe_latency');
-    const msgHtml = e.message.split(',').map(m => {
-      const t=m.trim();
-      return `<span class="badge ${isErr?'b-err':'b-warn'}">${t}</span>`;
-    }).join(' ');
-    return `<tr>
-      <td style="color:#64748b;white-space:nowrap">${ts(e.timestamp)}</td>
-      <td>${catBadge(e.category)}</td>
-      <td>${msgHtml}</td>
-    </tr>`;
-  }).join('');
-}
-
-// Stores expanded incident filenames to toggle.
-const expandedIncidents = new Set();
-
-async function loadIncidentContent(filename, cell) {
-  if (expandedIncidents.has(filename)) {
-    expandedIncidents.delete(filename);
-    cell.querySelector('.incident-content').classList.remove('open');
-    cell.querySelector('.expand-btn').textContent = 'show';
-    return;
+  const data = await r.json();
+  if (data.recommendation_24) {
+    document.getElementById('wifiChanRec').textContent = data.recommendation_24;
   }
-  const r = await fetch(`/api/incidents/${encodeURIComponent(filename)}`).catch(()=>null);
-  if (!r?.ok) return;
-  const text = await r.text();
-  expandedIncidents.add(filename);
-  const pre = cell.querySelector('.incident-content');
-  pre.textContent = text;
-  pre.classList.add('open');
-  cell.querySelector('.expand-btn').textContent = 'hide';
-}
+  const c24Counts = [1,2,3,4,5,6,7,8,9,10,11,12,13].map(ch => data.channels_24[ch]?.count || 0);
+  cChan24.data.datasets[0].data = c24Counts;
+  cChan24.update('none');
 
-async function updateIncidents() {
-  const r = await fetch('/api/incidents').catch(()=>null);
-  if (!r?.ok) return;
-  const rows = await r.json();
-  const tb = document.getElementById('tIncidents');
-  if (!rows.length) { tb.innerHTML='<tr><td colspan="3" class="dim">No incidents yet</td></tr>'; return; }
-  tb.innerHTML = rows.map(i => `<tr>
-    <td>
-      <span class="mono">${i.filename}</span>
-      <button class="expand-btn" onclick="loadIncidentContent('${i.filename}',this.closest('td'))">show</button>
-      <div class="incident-content"></div>
-    </td>
-    <td>${(i.size_bytes/1024).toFixed(1)} KB</td>
-    <td style="color:#64748b">${i.modified.substring(0,19).replace('T',' ')}</td>
-  </tr>`).join('');
+  const ch5Keys = Object.keys(data.channels_5).sort((a,b) => Number(a)-Number(b));
+  if (ch5Keys.length) {
+    cChan5.data.labels = ch5Keys;
+    cChan5.data.datasets[0].data = ch5Keys.map(k => data.channels_5[k].count);
+    cChan5.update('none');
+  }
 }
 
 async function updateWifiScan() {
@@ -1198,13 +1268,264 @@ async function updateWifiScan() {
   </tr>`).join('');
 }
 
+// ---------------------------------------------------------------------------
+// NIC & Interface Updates
+// ---------------------------------------------------------------------------
+async function updateNic() {
+  const r = await fetch(`/api/nic?n=${currentHistoryN}`).catch(()=>null);
+  if (!r?.ok) return;
+  const rows = await r.json();
+  if (!rows.length) return;
+
+  const allIfaces = [...new Set(rows.map(r => r.interface))];
+  const activeIfaces = allIfaces.filter(iface => {
+    const ifRows = rows.filter(r => r.interface === iface);
+    const peak = Math.max(...ifRows.map(r => (r.bytes_recv_ps||0)+(r.bytes_sent_ps||0)));
+    return peak > 1024;
+  });
+
+  if (!activeIfaces.length) return;
+
+  const labels = rows
+    .filter(r => r.interface === activeIfaces[0])
+    .map(r => ts(r.timestamp));
+
+  activeIfaces.forEach(iface => {
+    ensureNicDataset(cNic,    nicThroughputAdapters, iface, 'KB/s');
+    ensureNicDataset(cNicErr, nicErrorAdapters,      iface, 'err/s');
+  });
+
+  cNic.data.labels    = labels;
+  cNicErr.data.labels = labels;
+
+  const ifaceArr = [...nicThroughputAdapters];
+  ifaceArr.forEach((iface, i) => {
+    const ifRows = rows.filter(r => r.interface === iface);
+    cNic.data.datasets[i].data =
+      ifRows.map(r => kb((r.bytes_recv_ps||0) + (r.bytes_sent_ps||0)));
+    cNicErr.data.datasets[i].data =
+      ifRows.map(r => (r.errin_ps||0)+(r.errout_ps||0)+
+                      (r.dropin_ps||0)+(r.dropout_ps||0));
+  });
+
+  cNic.update('none');
+  cNicErr.update('none');
+}
+
+async function updateNicActive() {
+  const r = await fetch('/api/nic/active').catch(()=>null);
+  if (!r?.ok) return;
+  const d = await r.json();
+
+  const el = document.getElementById('mActiveIface');
+  if (d.active) {
+    el.textContent = d.active;
+    el.className = 'val ok';
+  } else {
+    el.textContent = '—';
+    el.className = 'val dim';
+  }
+
+  const list = document.getElementById('ifaceList');
+  if (!d.interfaces?.length) { list.innerHTML = ''; return; }
+
+  list.innerHTML = d.interfaces.map((iface, i) => {
+    const isActive = i === 0 && iface.total_bps > 1024;
+    const colour   = isActive ? '#34d399' : '#64748b';
+    return `<div style="color:${colour}">
+      ${isActive ? '▶ ' : ''}<strong>${iface.interface}</strong>
+      &nbsp;↓${(iface.bytes_recv_ps/1024).toFixed(1)}
+      &nbsp;↑${(iface.bytes_sent_ps/1024).toFixed(1)} KB/s
+    </div>`;
+  }).join('');
+}
+
+const timelineAdapters = new Set();
+async function updateIfaceTimeline() {
+  const r = await fetch(`/api/nic/timeline?n=${currentHistoryN}`).catch(()=>null);
+  if (!r?.ok) return;
+  const data = await r.json();
+
+  const ifaces = Object.keys(data);
+  if (!ifaces.length) return;
+
+  const labels = (data[ifaces[0]] || []).map(s => ts(s.timestamp));
+  ifaces.forEach(iface => {
+    if (!timelineAdapters.has(iface)) {
+      timelineAdapters.add(iface);
+      const idx    = timelineAdapters.size - 1;
+      const colour = NIC_COLOURS[idx % NIC_COLOURS.length];
+      cIfaceTimeline.data.datasets.push(ds(iface, colour));
+    }
+  });
+
+  cIfaceTimeline.data.labels = labels;
+  const ifaceArr = [...timelineAdapters];
+  ifaceArr.forEach((iface, i) => {
+    const samples = data[iface] || [];
+    cIfaceTimeline.data.datasets[i].data = samples.map(s => kb(s.total_bps));
+  });
+
+  cIfaceTimeline.update('none');
+  document.getElementById('ifaceNote').textContent =
+    `— ${ifaces.length} adapter${ifaces.length !== 1 ? 's' : ''}`;
+}
+
+async function updateTcp() {
+  const r = await fetch('/api/tcp?n=1').catch(()=>null);
+  if (!r?.ok) return;
+  const rows = await r.json();
+  if (!rows.length) return;
+  const t = rows[rows.length-1];
+  cTcp.data.datasets[0].data = [t.established||0];
+  cTcp.data.datasets[1].data = [t.time_wait||0];
+  cTcp.data.datasets[2].data = [t.close_wait||0];
+  cTcp.data.datasets[3].data = [t.listen||0];
+  cTcp.data.datasets[4].data = [(t.syn_sent||0)+(t.syn_recv||0)+(t.fin_wait1||0)+
+    (t.fin_wait2||0)+(t.closing||0)+(t.last_ack||0)+(t.other||0)];
+  cTcp.update('none');
+}
+
+// ---------------------------------------------------------------------------
+// Network Hogs, LAN Neighbors & mDNS Discovery
+// ---------------------------------------------------------------------------
+async function updateProcesses() {
+  const r = await fetch('/api/processes').catch(()=>null);
+  if (!r?.ok) return;
+  const rows = await r.json();
+  const tb = document.getElementById('tProcesses');
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="5" class="dim">No network-active applications detected</td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.map(p => `<tr>
+    <td style="font-weight:600;color:#f8fafc">${p.name}</td>
+    <td class="mono" style="color:#64748b">${p.pid}</td>
+    <td>${p.conn_count} conn${p.conn_count !== 1 ? 's' : ''}</td>
+    <td style="color:#34d399">&darr; ${(p.read_bytes_ps/1024).toFixed(1)} KB/s</td>
+    <td style="color:#fbbf24">&uarr; ${(p.write_bytes_ps/1024).toFixed(1)} KB/s</td>
+  </tr>`).join('');
+}
+
+async function updateLanDevices() {
+  const r = await fetch('/api/lan_devices?n=200').catch(()=>null);
+  if (!r?.ok) return;
+  const rows = await r.json();
+  const tb = document.getElementById('tLan');
+  document.getElementById('lanCount').textContent = `${rows.length} devices detected`;
+
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="6" class="dim">No LAN devices discovered yet</td></tr>';
+    return;
+  }
+
+  tb.innerHTML = rows.map(d => {
+    const isGw = (d.device_type === 'gateway');
+    const typeBadge = isGw ? '<span class="badge b-err">Gateway / Router</span>' : '<span class="badge b-info">LAN Host</span>';
+    const vendorBadge = d.vendor ? `<span class="badge b-net">${d.vendor}</span>` : '<span style="color:#64748b">Unknown OUI</span>';
+    return `<tr>
+      <td class="mono" style="font-weight:600;color:#f8fafc">${d.ip_address}</td>
+      <td class="mono" style="color:#94a3b8">${d.mac_address}</td>
+      <td>${vendorBadge}</td>
+      <td class="mono" style="color:#64748b">${d.interface_ip || '—'}</td>
+      <td>${typeBadge}</td>
+      <td style="color:#64748b">${d.last_seen ? d.last_seen.substring(11,19) : '—'}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function updateMdns() {
+  const r = await fetch('/api/mdns?n=100').catch(()=>null);
+  if (!r?.ok) return;
+  const rows = await r.json();
+  const tb = document.getElementById('tMdns');
+  document.getElementById('mdnsCount').textContent = `${rows.length} active announcements`;
+
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="4" class="dim">Listening for mDNS ZeroConf announcements&hellip;</td></tr>';
+    return;
+  }
+
+  tb.innerHTML = rows.map(m => {
+    const srvBadges = (m.services || '').split(',').filter(Boolean).map(s =>
+      `<span class="badge b-wifi">${s.trim()}</span>`
+    ).join(' ') || '<span style="color:#64748b">Device Announcement</span>';
+
+    return `<tr>
+      <td class="mono" style="font-weight:600;color:#f8fafc">${m.ip_address}</td>
+      <td class="mono" style="color:#38bdf8">${m.hostname || '—'}</td>
+      <td>${srvBadges}</td>
+      <td style="color:#64748b">${m.last_seen ? m.last_seen.substring(11,19) : '—'}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ---------------------------------------------------------------------------
+// Path MTU & Multi-DNS Diagnostics
+// ---------------------------------------------------------------------------
+async function updateMtu() {
+  const r = await fetch('/api/mtu').catch(()=>null);
+  if (!r?.ok) return;
+  const rows = await r.json();
+  const tb = document.getElementById('tMtu');
+  if (!rows.length) return;
+
+  const latest = rows[0];
+  document.getElementById('mtuTarget').textContent = latest.target_host || '—';
+  document.getElementById('mtuVal').textContent    = latest.path_mtu ? `${latest.path_mtu}` : '—';
+  document.getElementById('mtuPayload').textContent= latest.max_unfragmented_payload ? `${latest.max_unfragmented_payload}` : '—';
+
+  const fragEl = document.getElementById('mtuFrag');
+  if (latest.status === 'optimal') {
+    fragEl.innerHTML = '<span class="badge b-ok">Optimal (1500)</span>';
+  } else if (latest.status === 'reduced') {
+    fragEl.innerHTML = '<span class="badge b-warn">Reduced (' + (latest.path_mtu || 'PPPoE') + ')</span>';
+  } else {
+    fragEl.innerHTML = '<span class="badge b-info">' + (latest.status || 'Unknown') + '</span>';
+  }
+
+  document.getElementById('mtuNotes').textContent = latest.notes || '—';
+
+  tb.innerHTML = rows.map(m => `<tr>
+    <td style="color:#64748b">${ts(m.timestamp)}</td>
+    <td class="mono">${m.target_host}</td>
+    <td style="font-weight:600;color:#38bdf8">${m.path_mtu ? m.path_mtu + ' bytes' : '—'}</td>
+    <td>${m.max_unfragmented_payload ? m.max_unfragmented_payload + ' bytes' : '—'}</td>
+    <td><span class="badge ${m.status==='optimal'?'b-ok':m.status==='reduced'?'b-warn':'b-info'}">${m.status}</span></td>
+    <td style="color:#94a3b8">${m.notes || '—'}</td>
+  </tr>`).join('');
+}
+
+async function updateDnsBenchmark() {
+  const r = await fetch('/api/dns_benchmark?n=1').catch(()=>null);
+  if (!r?.ok) return;
+  const rows = await r.json();
+  if (!rows.length) return;
+  const b = rows[0];
+  document.getElementById('dLocal').textContent = fmt(b.local_ms);
+  document.getElementById('dCf').textContent    = fmt(b.cloudflare_ms);
+  document.getElementById('dGoog').textContent  = fmt(b.google_ms);
+  document.getElementById('dQuad').textContent  = fmt(b.quad9_ms);
+  if (b.fastest) {
+    document.getElementById('dnsBenchFastest').textContent = `Fastest: ${b.fastest}`;
+    if (b.local_ms && b.cloudflare_ms && b.cloudflare_ms < b.local_ms) {
+      const diff = Math.round(b.local_ms - b.cloudflare_ms);
+      document.getElementById('dnsRecommendation').textContent =
+        `Tip: Cloudflare (1.1.1.1) is ${diff} ms faster than your Local ISP DNS.`;
+    } else {
+      document.getElementById('dnsRecommendation').textContent =
+        'Local DNS latency is healthy and competitive with public resolvers.';
+    }
+  }
+}
+
 async function updateBloat() {
   const r = await fetch('/api/bufferbloat?n=20').catch(()=>null);
   if (!r?.ok) return;
   const rows = await r.json();
   const tb = document.getElementById('tBloat');
   if (!rows.length) {
-    tb.innerHTML = '<tr><td colspan="7" class="dim">No scans yet (runs every 5 min)</td></tr>';
+    tb.innerHTML = '<tr><td colspan="7" class="dim">No scans yet (runs every 5 min)&hellip;</td></tr>';
     return;
   }
   const rc = { good:'b-ok', moderate:'b-warn', bad:'b-err', severe:'b-err', unknown:'b-info' };
@@ -1227,11 +1548,10 @@ async function updateSpeed() {
   const tb = document.getElementById('tSpeed');
 
   if (!rows.length) {
-    tb.innerHTML = '<tr><td colspan="4" class="dim">No tests yet (runs every 15 min)</td></tr>';
+    tb.innerHTML = '<tr><td colspan="4" class="dim">No tests yet (runs every 15 min)&hellip;</td></tr>';
     return;
   }
 
-  // Update age label using most recent result (rows are newest-first).
   const latest = rows[0];
   if (latest?.timestamp) {
     const secs = Math.round((Date.now() - new Date(latest.timestamp).getTime()) / 1000);
@@ -1240,13 +1560,11 @@ async function updateSpeed() {
       `— last test ${mins > 0 ? mins + 'm' : secs + 's'} ago`;
   }
 
-  // Charts expect oldest-first.
   const chronological = [...rows].reverse();
   const labels = chronological.map(r => ts(r.timestamp));
   upd(cSpeedDl, labels, chronological.map(r => r.download_mbps));
   upd(cSpeedUl, labels, chronological.map(r => r.upload_mbps));
 
-  // Colour-code download speed relative to the maximum seen.
   const maxDl = Math.max(...rows.map(r => r.download_mbps || 0), 1);
   const speedCls = (mbps) => {
     if (mbps == null) return 'error';
@@ -1264,7 +1582,64 @@ async function updateSpeed() {
   </tr>`).join('');
 }
 
-// Initialise export date pickers to last 24 h.
+// ---------------------------------------------------------------------------
+// Events, Incidents & Export
+// ---------------------------------------------------------------------------
+async function updateEvents() {
+  const r = await fetch('/api/events?n=100').catch(()=>null);
+  if (!r?.ok) return;
+  const rows = await r.json();
+  const tb = document.getElementById('tEvents');
+  if (!rows.length) { tb.innerHTML='<tr><td colspan="3" class="dim">No events yet</td></tr>'; return; }
+  tb.innerHTML = rows.map(e => {
+    const isErr = e.message.includes('packet_loss')||e.message.includes('severe_latency');
+    const msgHtml = e.message.split(',').map(m => {
+      const t=m.trim();
+      return `<span class="badge ${isErr?'b-err':'b-warn'}">${t}</span>`;
+    }).join(' ');
+    return `<tr>
+      <td style="color:#64748b;white-space:nowrap">${ts(e.timestamp)}</td>
+      <td>${catBadge(e.category)}</td>
+      <td>${msgHtml}</td>
+    </tr>`;
+  }).join('');
+}
+
+const expandedIncidents = new Set();
+async function loadIncidentContent(filename, cell) {
+  if (expandedIncidents.has(filename)) {
+    expandedIncidents.delete(filename);
+    cell.querySelector('.incident-content').classList.remove('open');
+    cell.querySelector('.expand-btn').textContent = 'show';
+    return;
+  }
+  const r = await fetch(`/api/incidents/${encodeURIComponent(filename)}`).catch(()=>null);
+  if (!r?.ok) return;
+  const text = await r.text();
+  expandedIncidents.add(filename);
+  const pre = cell.querySelector('.incident-content');
+  pre.textContent = text;
+  pre.classList.add('open');
+  cell.querySelector('.expand-btn').textContent = 'hide';
+}
+
+async function updateIncidents() {
+  const r = await fetch('/api/incidents').catch(()=>null);
+  if (!r?.ok) return;
+  const rows = await r.json();
+  const tb = document.getElementById('tIncidents');
+  if (!rows.length) { tb.innerHTML='<tr><td colspan="3" class="dim">No incidents yet</td></tr>'; return; }
+  tb.innerHTML = rows.map(i => `<tr>
+    <td>
+      <span class="mono">${i.filename}</span>
+      <button class="expand-btn" onclick="loadIncidentContent('${i.filename}',this.closest('td'))">show</button>
+      <div class="incident-content"></div>
+    </td>
+    <td>${(i.size_bytes/1024).toFixed(1)} KB</td>
+    <td style="color:#64748b">${i.modified.substring(0,19).replace('T',' ')}</td>
+  </tr>`).join('');
+}
+
 (function initExportDates() {
   const pad = n => String(n).padStart(2,'0');
   const toLocal = d =>
@@ -1276,10 +1651,10 @@ async function updateSpeed() {
 })();
 
 function doExport() {
-  const table  = document.getElementById('expTable').value;
-  const fmt    = document.getElementById('expFmt').value;
-  const from   = document.getElementById('expFrom').value;
-  const to     = document.getElementById('expTo').value;
+  const table   = document.getElementById('expTable').value;
+  const fmt     = document.getElementById('expFmt').value;
+  const from    = document.getElementById('expFrom').value;
+  const to      = document.getElementById('expTo').value;
   const fromIso = from.length === 16 ? from + ':00' : from;
   const toIso   = to.length   === 16 ? to   + ':00' : to;
   const url = `/api/export?table=${encodeURIComponent(table)}&format=${fmt}`
@@ -1292,80 +1667,8 @@ function doExport() {
   document.body.removeChild(a);
 }
 
-async function updateNicActive() {
-  const r = await fetch('/api/nic/active').catch(()=>null);
-  if (!r?.ok) return;
-  const d = await r.json();
-
-  // Update the Active Interface metric in the grid.
-  const el = document.getElementById('mActiveIface');
-  if (d.active) {
-    el.textContent = d.active;
-    el.className = 'val ok';
-  } else {
-    el.textContent = '—';
-    el.className = 'val dim';
-  }
-
-  // Render a ranked interface list below the timeline chart.
-  const list = document.getElementById('ifaceList');
-  if (!d.interfaces?.length) { list.innerHTML = ''; return; }
-
-  list.innerHTML = d.interfaces.map((iface, i) => {
-    const isActive = i === 0 && iface.total_bps > 1024;
-    const colour   = isActive ? '#34d399' : '#64748b';
-    const kbs      = (iface.total_bps / 1024).toFixed(1);
-    return `<div style="color:${colour}">
-      ${isActive ? '▶ ' : ''}<strong>${iface.interface}</strong>
-      &nbsp;↓${(iface.bytes_recv_ps/1024).toFixed(1)}
-      &nbsp;↑${(iface.bytes_sent_ps/1024).toFixed(1)} KB/s
-    </div>`;
-  }).join('');
-}
-
-// Track which interfaces have been added to the timeline chart.
-const timelineAdapters = new Set();
-
-async function updateIfaceTimeline() {
-  const r = await fetch('/api/nic/timeline?n=300').catch(()=>null);
-  if (!r?.ok) return;
-  const data = await r.json();
-
-  const ifaces = Object.keys(data);
-  if (!ifaces.length) return;
-
-  // Use the first interface's timestamps as the shared x-axis.
-  const labels = (data[ifaces[0]] || []).map(s => ts(s.timestamp));
-
-  // Add a dataset for each new interface.
-  ifaces.forEach(iface => {
-    if (!timelineAdapters.has(iface)) {
-      timelineAdapters.add(iface);
-      const idx    = timelineAdapters.size - 1;
-      const colour = NIC_COLOURS[idx % NIC_COLOURS.length];
-      cIfaceTimeline.data.datasets.push(ds(iface, colour));
-    }
-  });
-
-  cIfaceTimeline.data.labels = labels;
-
-  // Populate each dataset. Use adapter insertion order.
-  const ifaceArr = [...timelineAdapters];
-  ifaceArr.forEach((iface, i) => {
-    const samples = data[iface] || [];
-    cIfaceTimeline.data.datasets[i].data = samples.map(s => kb(s.total_bps));
-  });
-
-  cIfaceTimeline.update('none');
-
-  // Update the note in the heading.
-  document.getElementById('ifaceNote').textContent =
-    `— ${ifaces.length} active adapter${ifaces.length !== 1 ? 's' : ''}`;
-}
-
-
 // ---------------------------------------------------------------------------
-// On-Demand Actions & Pollers (Feature 1)
+// On-Demand Actions
 // ---------------------------------------------------------------------------
 async function triggerAction(actionName, btn) {
   if (btn) btn.disabled = true;
@@ -1380,7 +1683,7 @@ async function triggerAction(actionName, btn) {
     });
     const d = await r.json();
     if (d.id) {
-      statusEl.innerHTML = `<span class="spinner"></span>${actionName} queued (ID ${d.id}), running in background...`;
+      statusEl.innerHTML = `<span class="spinner"></span>${actionName} queued (ID ${d.id}), executing in background...`;
       pollAction(d.id, btn);
     } else {
       statusEl.textContent = d.error || 'Failed to queue action';
@@ -1397,7 +1700,7 @@ async function triggerTraceroute(btn) {
   if (btn) btn.disabled = true;
   const statusEl = document.getElementById('actionStatus');
   statusEl.style.display = 'block';
-  statusEl.innerHTML = `<span class="spinner"></span>Running traceroute to ${target}... (may take 30-60s)`;
+  statusEl.innerHTML = `<span class="spinner"></span>Running traceroute to ${target}... (may take 20-40s)`;
   try {
     const r = await fetch('/api/actions', {
       method: 'POST',
@@ -1440,76 +1743,8 @@ async function pollAction(id, btn) {
 }
 
 // ---------------------------------------------------------------------------
-// Process Network Hogs (Feature 3)
+// Main Polling Loop
 // ---------------------------------------------------------------------------
-async function updateProcesses() {
-  const r = await fetch('/api/processes').catch(()=>null);
-  if (!r?.ok) return;
-  const rows = await r.json();
-  const tb = document.getElementById('tProcesses');
-  if (!rows.length) {
-    tb.innerHTML = '<tr><td colspan="5" class="dim">No network-active applications detected</td></tr>';
-    return;
-  }
-  tb.innerHTML = rows.map(p => `<tr>
-    <td style="font-weight:600;color:#f8fafc">${p.name}</td>
-    <td class="mono" style="color:#64748b">${p.pid}</td>
-    <td>${p.conn_count} conn${p.conn_count !== 1 ? 's' : ''}</td>
-    <td style="color:#34d399">&darr; ${(p.read_bytes_ps/1024).toFixed(1)} KB/s</td>
-    <td style="color:#fbbf24">&uarr; ${(p.write_bytes_ps/1024).toFixed(1)} KB/s</td>
-  </tr>`).join('');
-}
-
-// ---------------------------------------------------------------------------
-// Multi-DNS Benchmark (Feature 6)
-// ---------------------------------------------------------------------------
-async function updateDnsBenchmark() {
-  const r = await fetch('/api/dns_benchmark?n=1').catch(()=>null);
-  if (!r?.ok) return;
-  const rows = await r.json();
-  if (!rows.length) return;
-  const b = rows[0];
-  document.getElementById('dLocal').textContent = fmt(b.local_ms);
-  document.getElementById('dCf').textContent    = fmt(b.cloudflare_ms);
-  document.getElementById('dGoog').textContent  = fmt(b.google_ms);
-  document.getElementById('dQuad').textContent  = fmt(b.quad9_ms);
-  if (b.fastest) {
-    document.getElementById('dnsBenchFastest').textContent = `Fastest: ${b.fastest}`;
-    if (b.local_ms && b.cloudflare_ms && b.cloudflare_ms < b.local_ms) {
-      const diff = Math.round(b.local_ms - b.cloudflare_ms);
-      document.getElementById('dnsRecommendation').textContent =
-        `Tip: Cloudflare (1.1.1.1) is ${diff} ms faster than your Local ISP DNS.`;
-    } else {
-      document.getElementById('dnsRecommendation').textContent =
-        'Local DNS latency is healthy and competitive with public resolvers.';
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Wi-Fi Channel Overlap (Feature 7)
-// ---------------------------------------------------------------------------
-async function updateWifiChannels() {
-  const r = await fetch('/api/wifi_channels').catch(()=>null);
-  if (!r?.ok) return;
-  const data = await r.json();
-  if (data.recommendation_24) {
-    document.getElementById('wifiChanRec').textContent = data.recommendation_24;
-  }
-  // 2.4 GHz channels 1..13
-  const c24Counts = [1,2,3,4,5,6,7,8,9,10,11,12,13].map(ch => data.channels_24[ch]?.count || 0);
-  cChan24.data.datasets[0].data = c24Counts;
-  cChan24.update('none');
-
-  // 5 GHz channels
-  const ch5Keys = Object.keys(data.channels_5).sort((a,b) => Number(a)-Number(b));
-  if (ch5Keys.length) {
-    cChan5.data.labels = ch5Keys;
-    cChan5.data.datasets[0].data = ch5Keys.map(k => data.channels_5[k].count);
-    cChan5.update('none');
-  }
-}
-
 async function refresh() {
   await Promise.all([
     updateStatus(), updateLatest(), updateHistory(),
@@ -1517,6 +1752,7 @@ async function refresh() {
     updateNic(), updateTcp(), updateBloat(), updateSpeed(),
     updateEvents(), updateIncidents(), updateWifiScan(),
     updateProcesses(), updateDnsBenchmark(), updateWifiChannels(),
+    updateLanDevices(), updateMdns(), updateMtu(),
   ]);
 }
 
@@ -1533,7 +1769,7 @@ def dashboard():
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Entry Point
 # ---------------------------------------------------------------------------
 
 def main():

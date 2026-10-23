@@ -85,6 +85,78 @@ class TestNetworkMonitor(unittest.TestCase):
             finally:
                 storage.close()
 
+    def test_storage_device_discovery_and_mtu(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            storage = anm.Storage(db_path)
+            try:
+                # LAN devices upsert
+                storage.upsert_lan_devices([
+                    anm.LanDevice(
+                        timestamp="2026-10-23T05:00:00",
+                        ip_address="10.0.10.1",
+                        mac_address="cc:28:aa:11:22:33",
+                        vendor="Ubiquiti",
+                        interface_ip="10.0.10.100",
+                        device_type="gateway",
+                        last_seen="2026-10-23T05:00:00",
+                    ),
+                    anm.LanDevice(
+                        timestamp="2026-10-23T05:00:00",
+                        ip_address="10.0.10.50",
+                        mac_address="b8:27:eb:11:22:33",
+                        vendor="Raspberry Pi",
+                        interface_ip="10.0.10.100",
+                        device_type="host",
+                        last_seen="2026-10-23T05:00:00",
+                    ),
+                ])
+
+                cur = storage.connection.execute("SELECT COUNT(*) FROM lan_devices")
+                self.assertEqual(cur.fetchone()[0], 2)
+
+                # Upsert update last_seen
+                storage.upsert_lan_devices([
+                    anm.LanDevice(
+                        timestamp="2026-10-23T05:05:00",
+                        ip_address="10.0.10.1",
+                        mac_address="cc:28:aa:11:22:33",
+                        vendor="Ubiquiti",
+                        interface_ip="10.0.10.100",
+                        device_type="gateway",
+                        last_seen="2026-10-23T05:05:00",
+                    )
+                ])
+                cur = storage.connection.execute("SELECT last_seen FROM lan_devices WHERE ip_address='10.0.10.1'")
+                self.assertEqual(cur.fetchone()[0], "2026-10-23T05:05:00")
+
+                # mDNS devices upsert
+                storage.upsert_mdns_devices([
+                    anm.MdnsDevice(
+                        timestamp="2026-10-23T05:00:00",
+                        ip_address="10.0.10.50",
+                        hostname="raspberrypi.local",
+                        services=["_ssh._tcp.local", "_http._tcp.local"],
+                        last_seen="2026-10-23T05:00:00",
+                    )
+                ])
+                cur = storage.connection.execute("SELECT hostname FROM mdns_devices WHERE ip_address='10.0.10.50'")
+                self.assertEqual(cur.fetchone()[0], "raspberrypi.local")
+
+                # Path MTU sample insert
+                storage.insert_mtu_sample(anm.MtuSample(
+                    timestamp="2026-10-23T05:00:00",
+                    target_host="1.1.1.1",
+                    max_unfragmented_payload=1464,
+                    path_mtu=1492,
+                    status="reduced",
+                    notes="Reduced MTU (1492), likely PPPoE or VPN",
+                ))
+                cur = storage.connection.execute("SELECT path_mtu FROM mtu_samples WHERE target_host='1.1.1.1'")
+                self.assertEqual(cur.fetchone()[0], 1492)
+            finally:
+                storage.close()
+
     def test_n_param_sanitization(self):
         with web_dashboard.app.test_request_context("/api/history?n=-1"):
             self.assertEqual(web_dashboard.n_param(), 1)
@@ -161,6 +233,37 @@ class TestNetworkMonitor(unittest.TestCase):
                         cipher="CCMP",
                     ),
                 ])
+
+                storage.upsert_lan_devices([
+                    anm.LanDevice(
+                        timestamp="2026-10-23T05:00:00",
+                        ip_address="10.0.10.1",
+                        mac_address="cc:28:aa:11:22:33",
+                        vendor="Ubiquiti",
+                        interface_ip="10.0.10.100",
+                        device_type="gateway",
+                        last_seen="2026-10-23T05:00:00",
+                    )
+                ])
+
+                storage.upsert_mdns_devices([
+                    anm.MdnsDevice(
+                        timestamp="2026-10-23T05:00:00",
+                        ip_address="10.0.10.50",
+                        hostname="raspberrypi.local",
+                        services=["_ssh._tcp.local"],
+                        last_seen="2026-10-23T05:00:00",
+                    )
+                ])
+
+                storage.insert_mtu_sample(anm.MtuSample(
+                    timestamp="2026-10-23T05:00:00",
+                    target_host="1.1.1.1",
+                    max_unfragmented_payload=1464,
+                    path_mtu=1492,
+                    status="reduced",
+                    notes="Reduced MTU (1492), likely PPPoE or VPN",
+                ))
             finally:
                 storage.close()
 
@@ -193,14 +296,42 @@ class TestNetworkMonitor(unittest.TestCase):
             self.assertIn("recommendation_24", resp.json)
             self.assertEqual(resp.json["best_channel_24"], 1)
 
-            # Test /api/actions POST & GET (Feature 1)
-            resp = client.post("/api/actions", json={"action": "speedtest"})
-            self.assertEqual(resp.status_code, 202)
-            self.assertIn("id", resp.json)
+            # Test /api/lan_devices (Feature: LAN Neighbor discovery)
+            resp = client.get("/api/lan_devices")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(len(resp.json), 1)
+            self.assertEqual(resp.json[0]["vendor"], "Ubiquiti")
+
+            # Test /api/mdns (Feature: mDNS / ZeroConf)
+            resp = client.get("/api/mdns")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(len(resp.json), 1)
+            self.assertEqual(resp.json[0]["hostname"], "raspberrypi.local")
+
+            # Test /api/mtu (Feature: Path MTU)
+            resp = client.get("/api/mtu")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(len(resp.json), 1)
+            self.assertEqual(resp.json[0]["path_mtu"], 1492)
+
+            # Test /api/export (Feature: Data export)
+            resp = client.get("/api/export?table=lan_devices&format=json")
+            self.assertEqual(resp.status_code, 200)
+            self.assertIn("application/json", resp.content_type)
+
+            resp_csv = client.get("/api/export?table=lan_devices&format=csv")
+            self.assertEqual(resp_csv.status_code, 200)
+            self.assertIn("text/csv", resp_csv.content_type)
+
+            # Test /api/actions POST & GET (Feature 1 + New actions)
+            for act in ["speedtest", "lanscan", "mdnsscan", "mtuscan"]:
+                resp = client.post("/api/actions", json={"action": act})
+                self.assertEqual(resp.status_code, 202)
+                self.assertIn("id", resp.json)
 
             resp = client.get("/api/actions/latest")
             self.assertEqual(resp.status_code, 200)
-            self.assertTrue(len(resp.json) >= 1)
+            self.assertTrue(len(resp.json) >= 4)
 
 
 if __name__ == "__main__":

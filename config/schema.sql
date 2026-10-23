@@ -209,3 +209,49 @@ CREATE TABLE IF NOT EXISTS dns_benchmarks (
 CREATE INDEX IF NOT EXISTS idx_action_status ON action_queue        (status);
 CREATE INDEX IF NOT EXISTS idx_proc_ts       ON process_samples     (timestamp);
 CREATE INDEX IF NOT EXISTS idx_dns_bench_ts  ON dns_benchmarks      (timestamp);
+
+-- ---------------------------------------------------------------------------
+-- mdns_devices
+-- Discovered mDNS / Bonjour / ZeroConf devices on the local network
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS mdns_devices (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp   TEXT    NOT NULL,
+    ip_address  TEXT    NOT NULL UNIQUE,
+    hostname    TEXT,
+    services    TEXT,
+    last_seen   TEXT    NOT NULL
+);
+
+-- ---------------------------------------------------------------------------
+-- lan_devices
+-- Active ARP neighbor devices on the local subnet with MAC and vendor lookup
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS lan_devices (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp    TEXT    NOT NULL,
+    ip_address   TEXT    NOT NULL UNIQUE,
+    mac_address  TEXT    NOT NULL,
+    vendor       TEXT,
+    interface_ip TEXT,
+    device_type  TEXT,
+    last_seen    TEXT    NOT NULL
+);
+
+-- ---------------------------------------------------------------------------
+-- mtu_samples
+-- Path MTU and packet fragmentation diagnostics
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS mtu_samples (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp                 TEXT    NOT NULL,
+    target_host               TEXT    NOT NULL,
+    max_unfragmented_payload  INTEGER,
+    path_mtu                  INTEGER,
+    status                    TEXT,
+    notes                     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_mdns_ip ON mdns_devices (ip_address);
+CREATE INDEX IF NOT EXISTS idx_lan_ip  ON lan_devices  (ip_address);
+CREATE INDEX IF NOT EXISTS idx_mtu_ts  ON mtu_samples  (timestamp);
