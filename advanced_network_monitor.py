@@ -2133,6 +2133,56 @@ class Monitor:
 
         self._worker_pool.submit(_task)
 
+    def _trigger_lan_scan(self, action_id: Optional[int] = None):
+        def _task():
+            try:
+                devices = self.lan_probe.scan()
+                if devices:
+                    self.storage.upsert_lan_devices(devices)
+                msg = f"lanscan: discovered {len(devices)} active LAN neighbor devices"
+                self._add_event("network", msg)
+                if action_id:
+                    self.storage.update_action(action_id, "completed", msg)
+            except Exception as exc:
+                self._add_event("network", f"lanscan failed: {exc}")
+                if action_id:
+                    self.storage.update_action(action_id, "failed", str(exc))
+
+        self._worker_pool.submit(_task)
+
+    def _trigger_mdns_scan(self, action_id: Optional[int] = None):
+        def _task():
+            try:
+                devices = self.mdns_probe.scan(timeout=1.5)
+                if devices:
+                    self.storage.upsert_mdns_devices(devices)
+                msg = f"mdnsscan: discovered {len(devices)} mDNS services"
+                self._add_event("network", msg)
+                if action_id:
+                    self.storage.update_action(action_id, "completed", msg)
+            except Exception as exc:
+                self._add_event("network", f"mdnsscan failed: {exc}")
+                if action_id:
+                    self.storage.update_action(action_id, "failed", str(exc))
+
+        self._worker_pool.submit(_task)
+
+    def _trigger_mtu_scan(self, target: str = "1.1.1.1", action_id: Optional[int] = None):
+        def _task():
+            try:
+                mtu_sample = self.mtu_probe.run(target)
+                self.storage.insert_mtu_sample(mtu_sample)
+                msg = f"mtuscan to {target}: Path MTU {mtu_sample.path_mtu} ({mtu_sample.notes})"
+                self._add_event("network", msg)
+                if action_id:
+                    self.storage.update_action(action_id, "completed", msg)
+            except Exception as exc:
+                self._add_event("network", f"mtuscan failed: {exc}")
+                if action_id:
+                    self.storage.update_action(action_id, "failed", str(exc))
+
+        self._worker_pool.submit(_task)
+
     def _process_action_queue(self, dns_srv: Optional[str]):
         item = self.storage.poll_pending_action()
         if not item:
@@ -2265,7 +2315,7 @@ class Monitor:
             self._process_action_queue(dns_srv)
 
             # Feature 3: Sample network-active processes every 2 cycles
-            if self._cycle_count % 2 == 0:
+            if self._cycle_count == 1 or self._cycle_count % 2 == 0:
                 try:
                     proc_samples = self.proc_probe.read(top_n=8)
                     if proc_samples:
