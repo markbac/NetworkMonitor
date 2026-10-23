@@ -82,6 +82,22 @@ GATEWAY_CACHE_TTL  = 60   # seconds between ipconfig gateway re-reads
 NETSH_IFACE_TTL    = 10   # seconds between netsh wlan show interfaces re-reads
 IPCONFIG_ALL_TTL   = 10   # seconds between ipconfig /all re-reads
 
+# Matches the RTT token in a Windows ping reply in any display language, e.g.
+# "time=14ms TTL=", "Zeit<1ms TTL=", "время=14мс TTL=". Anchoring on the
+# following TTL field avoids relying on the localised word for "time".
+_PING_RTT_RE = re.compile(r"([=<])\s*(\d+(?:\.\d+)?)\s*[^\s\d=]+\s+TTL", re.IGNORECASE)
+
+
+def parse_ping_rtt(output: str) -> Optional[float]:
+    """Return the RTT in ms from ping output, 0.5 for '<1ms', or None."""
+    m = _PING_RTT_RE.search(output)
+    if not m:
+        return None
+    if m.group(1) == "<":
+        return 0.5
+    return float(m.group(2))
+
+
 # Separate logger for debug command tracing. Only activated with --debug.
 # Using a named logger keeps it independent of the root logger so it can
 # be enabled/disabled without affecting normal event logging.
@@ -1456,7 +1472,8 @@ class LanNeighborProbe:
         "e8:48:b8": "Samsung", "28:6c:07": "Xiaomi", "00:11:32": "Synology",
     }
 
-    def scan(self) -> list[LanDevice]:
+    def scan(self, gateway_ip: Optional[str] = None) -> list[LanDevice]:
+        """device_type is 'gateway' for gateway_ip, else the ARP type (dynamic/static)."""
         try:
             out = cmd_logger.check_output(["arp", "-a"], text=True, errors="ignore")
         except Exception:
@@ -1489,7 +1506,7 @@ class LanNeighborProbe:
                     mac_address=raw_mac,
                     vendor=vendor,
                     interface_ip=current_iface,
-                    device_type=ctype,
+                    device_type="gateway" if ip == gateway_ip else ctype,
                     last_seen=ts,
                 ))
         return devices
@@ -1605,8 +1622,8 @@ class Storage:
             ("action_queue",        "timestamp"),
             ("process_samples",     "timestamp"),
             ("dns_benchmarks",      "timestamp"),
-            ("mdns_devices",        "timestamp"),
-            ("lan_devices",         "timestamp"),
+            ("mdns_devices",        "last_seen"),
+            ("lan_devices",         "last_seen"),
             ("mtu_samples",         "timestamp"),
         ]
         with self._lock:
@@ -1846,8 +1863,10 @@ class Monitor:
 
         # Background worker pool for non-blocking speed tests, bufferbloat, and tracert
         self._worker_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="netmon_worker")
-        self._speed_test_running = False
-        self._bloat_test_running = False
+        # Speed test and bufferbloat both saturate the link, so only one may
+        # run at a time. Triggers come from the monitor and TUI threads.
+        self._link_test_lock = threading.Lock()
+        self._link_test_running = False
         self._tracert_running = False
         self._last_tracert_time = 0.0
         self.TRACERT_COOLDOWN_SECONDS = 300  # 5 min cooldown
@@ -1913,13 +1932,7 @@ class Monitor:
             )
             if result.returncode != 0:
                 return None
-            out = result.stdout.decode("utf-8", errors="ignore")
-            m = re.search(r"time[=<](\d+(?:\.\d+)?)ms", out, re.IGNORECASE)
-            if m:
-                return float(m.group(1))
-            if "<1ms" in out or "< 1ms" in out:
-                return 0.5
-            return None
+            return parse_ping_rtt(result.stdout.decode("utf-8", errors="ignore"))
         except Exception:
             return None
 
@@ -2017,12 +2030,19 @@ class Monitor:
     # Fault diagnostics
     # -----------------------------------------------------------------------
 
+    def _claim_link_test(self) -> bool:
+        """Mark a link-saturating test as running; False if one already is."""
+        with self._link_test_lock:
+            if self._link_test_running:
+                return False
+            self._link_test_running = True
+            return True
+
     def _trigger_speed_test(self, action_id: Optional[int] = None):
-        if self._speed_test_running:
+        if not self._claim_link_test():
             if action_id:
-                self.storage.update_action(action_id, "failed", "Speed test already in progress")
+                self.storage.update_action(action_id, "failed", "A speed or bufferbloat test is already in progress")
             return
-        self._speed_test_running = True
 
         def _task():
             try:
@@ -2038,16 +2058,15 @@ class Monitor:
                 if action_id:
                     self.storage.update_action(action_id, "failed", str(exc))
             finally:
-                self._speed_test_running = False
+                self._link_test_running = False
 
         self._worker_pool.submit(_task)
 
     def _trigger_bufferbloat(self, action_id: Optional[int] = None):
-        if self._bloat_test_running:
+        if not self._claim_link_test():
             if action_id:
-                self.storage.update_action(action_id, "failed", "Bufferbloat test already in progress")
+                self.storage.update_action(action_id, "failed", "A speed or bufferbloat test is already in progress")
             return
-        self._bloat_test_running = True
 
         def _task():
             try:
@@ -2071,7 +2090,7 @@ class Monitor:
                 if action_id:
                     self.storage.update_action(action_id, "failed", str(exc))
             finally:
-                self._bloat_test_running = False
+                self._link_test_running = False
 
         self._worker_pool.submit(_task)
 
@@ -2136,7 +2155,7 @@ class Monitor:
     def _trigger_lan_scan(self, action_id: Optional[int] = None):
         def _task():
             try:
-                devices = self.lan_probe.scan()
+                devices = self.lan_probe.scan(gateway_ip=self.gw_cache.get())
                 if devices:
                     self.storage.upsert_lan_devices(devices)
                 msg = f"lanscan: discovered {len(devices)} active LAN neighbor devices"
@@ -2171,6 +2190,7 @@ class Monitor:
         def _task():
             try:
                 mtu_sample = self.mtu_probe.run(target)
+                self.latest_mtu = mtu_sample
                 self.storage.insert_mtu_sample(mtu_sample)
                 msg = f"mtuscan to {target}: Path MTU {mtu_sample.path_mtu} ({mtu_sample.notes})"
                 self._add_event("network", msg)
@@ -2571,6 +2591,10 @@ class Monitor:
 
                         if self.latest_mtu and self.latest_mtu.path_mtu:
                             lines.append((f"Path MTU          : {self.latest_mtu.path_mtu} ({self.latest_mtu.status.upper()})", cp(1) if self.latest_mtu.path_mtu == 1500 else cp(2)))
+
+                        if self.latest_gw_ports:
+                            ports = "  ".join(f"{p}:{'open' if ok else 'closed'}" for p, ok in sorted(self.latest_gw_ports.items()))
+                            lines.append((f"Gateway Ports     : {ports}", 0))
 
                         lines.append(("", 0))
                         analysis_color = cp(3) if s.notes else cp(1)

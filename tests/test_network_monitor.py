@@ -1,8 +1,8 @@
 import os
-import re
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 import advanced_network_monitor as anm
 import web_dashboard
@@ -35,21 +35,48 @@ class TestNetworkMonitor(unittest.TestCase):
         with self.assertRaises(ValueError):
             anm.HostCycler([])
 
-    def test_ping_regex_parsing(self):
-        # Standard Windows ping reply
-        output_std = "Reply from 1.1.1.1: bytes=32 time=9ms TTL=59\r\n"
-        m = re.search(r"time[=<](\d+(?:\.\d+)?)ms", output_std, re.IGNORECASE)
-        self.assertIsNotNone(m)
-        self.assertEqual(float(m.group(1)), 9.0)
+    def test_ping_rtt_parsing(self):
+        parse = anm.parse_ping_rtt
+        self.assertEqual(parse("Reply from 1.1.1.1: bytes=32 time=9ms TTL=59\r\n"), 9.0)
+        self.assertEqual(parse("Reply from 192.168.1.1: bytes=32 time<1ms TTL=64\r\n"), 0.5)
+        # Localised output must not be reported as packet loss
+        self.assertEqual(parse("Antwort von 8.8.8.8: Bytes=32 Zeit=14ms TTL=117\r\n"), 14.0)
+        self.assertEqual(parse("Réponse de 8.8.8.8 : octets=32 temps=14 ms TTL=117\r\n"), 14.0)
+        self.assertEqual(parse("Ответ от 8.8.8.8: число байт=32 время=14мс TTL=117\r\n"), 14.0)
+        # Failures
+        self.assertIsNone(parse("Request timed out.\r\n"))
+        self.assertIsNone(parse("Reply from 192.168.1.1: Destination host unreachable.\r\n"))
 
-        # Fast LAN ping (<1ms)
-        output_fast = "Reply from 192.168.1.1: bytes=32 time<1ms TTL=64\r\n"
-        self.assertTrue("<1ms" in output_fast)
+    def test_lan_scan_tags_gateway(self):
+        arp_out = (
+            "Interface: 192.168.1.5 --- 0x5\n"
+            "  Internet Address      Physical Address      Type\n"
+            "  192.168.1.1           cc-28-aa-00-00-01     dynamic\n"
+            "  192.168.1.20          b8-27-eb-00-00-02     dynamic\n"
+        )
+        with mock.patch.object(anm.cmd_logger, "check_output", return_value=arp_out):
+            devices = anm.LanNeighborProbe().scan(gateway_ip="192.168.1.1")
+        types = {d.ip_address: d.device_type for d in devices}
+        self.assertEqual(types, {"192.168.1.1": "gateway", "192.168.1.20": "dynamic"})
 
-        # Timeout / failure
-        output_fail = "Request timed out.\r\n"
-        m_fail = re.search(r"time[=<](\d+(?:\.\d+)?)ms", output_fail, re.IGNORECASE)
-        self.assertIsNone(m_fail)
+    def test_purge_keeps_devices_still_seen(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = anm.Storage(os.path.join(tmpdir, "test.db"))
+            try:
+                old = "2000-01-01T00:00:00"
+                now = anm.datetime.now().isoformat()
+                storage.upsert_lan_devices([
+                    anm.LanDevice(old, "10.0.0.2", "aa:bb:cc:dd:ee:ff", "x", "10.0.0.5", "dynamic", now),
+                    anm.LanDevice(old, "10.0.0.3", "aa:bb:cc:dd:ee:00", "x", "10.0.0.5", "dynamic", old),
+                ])
+                storage.purge_old_rows(retention_days=30)
+                ips = [r[0] for r in storage.connection.execute("SELECT ip_address FROM lan_devices")]
+                self.assertEqual(ips, ["10.0.0.2"])
+            finally:
+                storage.close()
+
+    def test_web_dashboard_config_file_exists(self):
+        self.assertTrue(web_dashboard.CONFIG_FILE.is_file())
 
     def test_storage_thread_safety_and_actions(self):
         with tempfile.TemporaryDirectory() as tmpdir:

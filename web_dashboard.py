@@ -33,7 +33,7 @@ from flask import Flask, Response, jsonify, render_template_string, request
 # Configuration & Globals
 # ---------------------------------------------------------------------------
 
-CONFIG_FILE = Path(__file__).parent / "config" / "monitor_config.yaml"
+CONFIG_FILE = Path(__file__).parent / "config" / "default.yaml"
 
 DB_PATH: str = ""
 INCIDENTS_PATH: str = ""
@@ -968,6 +968,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 // ---------------------------------------------------------------------------
 const G = { text:'#94a3b8', grid:'#1a1f2e' };
 
+// Escape text from the network (SSIDs, mDNS names, process names) before
+// inserting it via innerHTML.
+function esc(v) {
+  return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
 function mkChart(id, datasets, yLabel, type='line') {
   return new Chart(document.getElementById(id).getContext('2d'), {
     type,
@@ -1258,7 +1264,7 @@ async function updateWifiScan() {
   };
 
   tb.innerHTML = rows.map(r => `<tr>
-    <td>${r.ssid || '<span style="color:#475569;font-style:italic">hidden</span>'}</td>
+    <td>${r.ssid ? esc(r.ssid) : '<span style="color:#475569;font-style:italic">hidden</span>'}</td>
     <td class="mono">${r.bssid}</td>
     <td>${sigBar(r.signal_pct)}</td>
     <td>${r.channel ?? '—'}</td>
@@ -1399,7 +1405,7 @@ async function updateProcesses() {
     return;
   }
   tb.innerHTML = rows.map(p => `<tr>
-    <td style="font-weight:600;color:#f8fafc">${p.name}</td>
+    <td style="font-weight:600;color:#f8fafc">${esc(p.name)}</td>
     <td class="mono" style="color:#64748b">${p.pid}</td>
     <td>${p.conn_count} conn${p.conn_count !== 1 ? 's' : ''}</td>
     <td style="color:#34d399">&darr; ${(p.read_bytes_ps/1024).toFixed(1)} KB/s</td>
@@ -1448,12 +1454,12 @@ async function updateMdns() {
 
   tb.innerHTML = rows.map(m => {
     const srvBadges = (m.services || '').split(',').filter(Boolean).map(s =>
-      `<span class="badge b-wifi">${s.trim()}</span>`
+      `<span class="badge b-wifi">${esc(s.trim())}</span>`
     ).join(' ') || '<span style="color:#64748b">Device Announcement</span>';
 
     return `<tr>
       <td class="mono" style="font-weight:600;color:#f8fafc">${m.ip_address}</td>
-      <td class="mono" style="color:#38bdf8">${m.hostname || '—'}</td>
+      <td class="mono" style="color:#38bdf8">${m.hostname ? esc(m.hostname) : '—'}</td>
       <td>${srvBadges}</td>
       <td style="color:#64748b">${m.last_seen ? m.last_seen.substring(11,19) : '—'}</td>
     </tr>`;
@@ -1700,7 +1706,7 @@ async function triggerTraceroute(btn) {
   if (btn) btn.disabled = true;
   const statusEl = document.getElementById('actionStatus');
   statusEl.style.display = 'block';
-  statusEl.innerHTML = `<span class="spinner"></span>Running traceroute to ${target}... (may take 20-40s)`;
+  statusEl.innerHTML = `<span class="spinner"></span>Running traceroute to ${esc(target)}... (may take 20-40s)`;
   try {
     const r = await fetch('/api/actions', {
       method: 'POST',
@@ -1730,12 +1736,12 @@ async function pollAction(id, btn) {
     if (item) {
       if (item.status === 'completed') {
         clearInterval(timer);
-        statusEl.innerHTML = `&#10004; ${item.result || (item.action + ' finished successfully')}`;
+        statusEl.innerHTML = `&#10004; ${esc(item.result || (item.action + ' finished successfully'))}`;
         if (btn) btn.disabled = false;
         refresh();
       } else if (item.status === 'failed') {
         clearInterval(timer);
-        statusEl.innerHTML = `&#10008; ${item.result || (item.action + ' failed')}`;
+        statusEl.innerHTML = `&#10008; ${esc(item.result || (item.action + ' failed'))}`;
         if (btn) btn.disabled = false;
       }
     }
