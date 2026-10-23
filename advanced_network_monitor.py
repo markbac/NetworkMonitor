@@ -72,6 +72,7 @@ from typing import Optional
 import psutil
 import requests
 import yaml
+from concurrent.futures import ThreadPoolExecutor
 from ctxlogkit import setup_logging
 
 
@@ -80,6 +81,22 @@ SCHEMA_FILE = "config/schema.sql"
 GATEWAY_CACHE_TTL  = 60   # seconds between ipconfig gateway re-reads
 NETSH_IFACE_TTL    = 10   # seconds between netsh wlan show interfaces re-reads
 IPCONFIG_ALL_TTL   = 10   # seconds between ipconfig /all re-reads
+
+# Matches the RTT token in a Windows ping reply in any display language, e.g.
+# "time=14ms TTL=", "Zeit<1ms TTL=", "время=14мс TTL=". Anchoring on the
+# following TTL field avoids relying on the localised word for "time".
+_PING_RTT_RE = re.compile(r"([=<])\s*(\d+(?:\.\d+)?)\s*[^\s\d=]+\s+TTL", re.IGNORECASE)
+
+
+def parse_ping_rtt(output: str) -> Optional[float]:
+    """Return the RTT in ms from ping output, 0.5 for '<1ms', or None."""
+    m = _PING_RTT_RE.search(output)
+    if not m:
+        return None
+    if m.group(1) == "<":
+        return 0.5
+    return float(m.group(2))
+
 
 # Separate logger for debug command tracing. Only activated with --debug.
 # Using a named logger keeps it independent of the root logger so it can
@@ -91,7 +108,6 @@ debug_log.propagate = False
 
 # Event logger. Configured by Monitor._setup_logging via ctxlogkit.
 log = logging.getLogger("netmon")
-debug_log.propagate = False  # don't send to root handler
 
 
 class CommandLogger:
@@ -271,6 +287,61 @@ class SpeedTestSample:
     duration_seconds: float
     download_url: str
     upload_url: str
+
+
+@dataclass
+class ProcessSample:
+    """Snapshot of a network-active process (network hog detection)."""
+    timestamp: str
+    pid: int
+    name: str
+    conn_count: int
+    read_bytes_ps: float
+    write_bytes_ps: float
+
+
+@dataclass
+class DnsBenchmarkSample:
+    """Benchmark comparing local DNS against public DNS resolvers."""
+    timestamp: str
+    local_ms: Optional[float]
+    cloudflare_ms: Optional[float]
+    google_ms: Optional[float]
+    quad9_ms: Optional[float]
+    fastest: Optional[str]
+
+
+@dataclass
+class MdnsDevice:
+    """mDNS / Bonjour / ZeroConf device discovered on local network."""
+    timestamp: str
+    ip_address: str
+    hostname: Optional[str]
+    services: list[str]
+    last_seen: str
+
+
+@dataclass
+class LanDevice:
+    """Active ARP neighbor device on the local subnet."""
+    timestamp: str
+    ip_address: str
+    mac_address: str
+    vendor: str
+    interface_ip: str
+    device_type: str
+    last_seen: str
+
+
+@dataclass
+class MtuSample:
+    """Path MTU and packet fragmentation diagnostic sample."""
+    timestamp: str
+    target_host: str
+    max_unfragmented_payload: Optional[int]
+    path_mtu: Optional[int]
+    status: str
+    notes: str
 
 
 # ---------------------------------------------------------------------------
@@ -974,27 +1045,25 @@ class BufferbloatProbe:
         """
         ts = datetime.now().isoformat()
 
-        # Start background download to saturate the uplink queue.
-        download_done = threading.Event()
+        # Start background download to saturate the link queue during measurements.
+        stop_event = threading.Event()
         bytes_downloaded = [0]
+        test_start = time.monotonic()
 
         def _download():
             try:
                 with requests.get(
                     self.download_url,
                     stream=True,
-                    timeout=self.test_duration + 5,
+                    timeout=self.test_duration + 10,
                 ) as resp:
                     resp.raise_for_status()
-                    deadline = time.monotonic() + self.test_duration
                     for chunk in resp.iter_content(chunk_size=65536):
                         bytes_downloaded[0] += len(chunk)
-                        if time.monotonic() >= deadline:
+                        if stop_event.is_set():
                             break
             except Exception:
                 pass
-            finally:
-                download_done.set()
 
         dl_thread = threading.Thread(target=_download, daemon=True)
         dl_thread.start()
@@ -1012,13 +1081,15 @@ class BufferbloatProbe:
                 loaded_rtts.append(rtt)
             time.sleep(ping_interval)
 
-        # Wait for download to finish (it should already be done).
-        dl_thread.join(timeout=2)
+        # Signal download to stop once all pings are complete.
+        stop_event.set()
+        dl_thread.join(timeout=3)
+        actual_duration = max(1.0, time.monotonic() - test_start)
 
         # Compute results.
         loaded_ms   = round(statistics.mean(loaded_rtts), 1) if loaded_rtts else None
         delta_ms    = round(loaded_ms - baseline_ms, 1) if (loaded_ms and baseline_ms) else None
-        dl_mbps     = round(bytes_downloaded[0] * 8 / 1_000_000 / self.test_duration, 2)
+        dl_mbps     = round(bytes_downloaded[0] * 8 / 1_000_000 / actual_duration, 2)
 
         rating = "unknown"
         if delta_ms is not None:
@@ -1165,23 +1236,365 @@ class SpeedTestProbe:
         return total_bytes[0], mbps
 
 
+
+# ---------------------------------------------------------------------------
+# Process network probe (Network Hogs)
+# ---------------------------------------------------------------------------
+
+class ProcessNetProbe:
+    """Monitors top network-active processes and bandwidth hogs."""
+
+    def __init__(self):
+        self._last_proc_io: dict[int, tuple[float, float, float]] = {}
+
+    def read(self, top_n: int = 8) -> list[ProcessSample]:
+        now = time.monotonic()
+        ts = datetime.now().isoformat()
+        samples: list[ProcessSample] = []
+        current_io: dict[int, tuple[float, float, float]] = {}
+
+        conn_counts: dict[int, int] = {}
+        try:
+            for conn in psutil.net_connections(kind="inet"):
+                if conn.pid and conn.status == "ESTABLISHED":
+                    conn_counts[conn.pid] = conn_counts.get(conn.pid, 0) + 1
+        except Exception:
+            pass
+
+        for p in psutil.process_iter(["pid", "name", "io_counters"]):
+            try:
+                pid = p.info["pid"]
+                if not pid or pid == 0:
+                    continue
+                name = p.info["name"] or f"PID {pid}"
+                io = p.info.get("io_counters")
+                conns = conn_counts.get(pid, 0)
+
+                if io:
+                    current_io[pid] = (float(io.read_bytes), float(io.write_bytes), now)
+                    prev = self._last_proc_io.get(pid)
+                    if prev:
+                        elapsed = max(0.1, now - prev[2])
+                        read_rate = max(0.0, (io.read_bytes - prev[0]) / elapsed)
+                        write_rate = max(0.0, (io.write_bytes - prev[1]) / elapsed)
+                    else:
+                        read_rate = 0.0
+                        write_rate = 0.0
+                else:
+                    read_rate = 0.0
+                    write_rate = 0.0
+
+                if conns > 0 or (read_rate + write_rate > 1024):
+                    samples.append(ProcessSample(
+                        timestamp=ts,
+                        pid=pid,
+                        name=name,
+                        conn_count=conns,
+                        read_bytes_ps=round(read_rate, 1),
+                        write_bytes_ps=round(write_rate, 1),
+                    ))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        self._last_proc_io = current_io
+        samples.sort(
+            key=lambda s: (s.read_bytes_ps + s.write_bytes_ps, s.conn_count),
+            reverse=True,
+        )
+        return samples[:top_n]
+
+
+# ---------------------------------------------------------------------------
+# DNS Benchmark Probe
+# ---------------------------------------------------------------------------
+
+class DnsBenchmarkProbe:
+    """Benchmarks DNS query latency across local DNS and major public resolvers."""
+
+    def run(self, local_dns: Optional[str]) -> DnsBenchmarkSample:
+        ts = datetime.now().isoformat()
+        local_ms = dns_server_latency(local_dns) if local_dns else None
+        cf_ms    = dns_server_latency("1.1.1.1")
+        goog_ms  = dns_server_latency("8.8.8.8")
+        quad_ms  = dns_server_latency("9.9.9.9")
+
+        scores = {}
+        if local_ms is not None: scores["Local DNS"] = local_ms
+        if cf_ms is not None:    scores["Cloudflare"] = cf_ms
+        if goog_ms is not None:  scores["Google"] = goog_ms
+        if quad_ms is not None:  scores["Quad9"] = quad_ms
+
+        fastest = min(scores, key=scores.get) if scores else None
+        return DnsBenchmarkSample(
+            timestamp=ts,
+            local_ms=local_ms,
+            cloudflare_ms=cf_ms,
+            google_ms=goog_ms,
+            quad9_ms=quad_ms,
+            fastest=fastest,
+        )
+
+
+
+# ---------------------------------------------------------------------------
+# mDNS / Bonjour / ZeroConf Probe
+# ---------------------------------------------------------------------------
+
+class MdnsProbe:
+    """Discovers smart devices and services via Multicast DNS (224.0.0.251:5353)."""
+
+    SERVICES_TO_QUERY = [
+        "_services._dns-sd._udp.local",
+        "_http._tcp.local",
+        "_workstation._tcp.local",
+        "_googlecast._tcp.local",
+        "_airplay._tcp.local",
+        "_ipp._tcp.local",
+        "_smb._tcp.local",
+        "_companion-link._tcp.local",
+    ]
+
+    @staticmethod
+    def _decode_name(data: bytes, offset: int) -> tuple[str, int]:
+        parts = []
+        visited = set()
+        initial_offset = offset
+        stepped = False
+        while offset < len(data):
+            if offset in visited:
+                break
+            visited.add(offset)
+            length = data[offset]
+            if length == 0:
+                if not stepped:
+                    initial_offset = offset + 1
+                break
+            elif (length & 0xC0) == 0xC0:
+                pointer = ((length & 0x3F) << 8) | data[offset + 1]
+                if not stepped:
+                    initial_offset = offset + 2
+                    stepped = True
+                offset = pointer
+            else:
+                offset += 1
+                parts.append(data[offset:offset + length].decode("utf-8", errors="ignore"))
+                offset += length
+                if not stepped:
+                    initial_offset = offset
+        return ".".join(parts), initial_offset
+
+    def scan(self, timeout: float = 1.2) -> list[MdnsDevice]:
+        devices: dict[str, dict] = {}
+        ts = datetime.now().isoformat()
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("", 5353))
+            mreq = struct.pack("4s4s", socket.inet_aton("224.0.0.251"), socket.inet_aton("0.0.0.0"))
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            sock.settimeout(0.3)
+
+            def encode_name(name: str) -> bytes:
+                parts = name.strip(".").split(".")
+                b = b""
+                for p in parts:
+                    b += bytes([len(p)]) + p.encode("utf-8")
+                return b + b"\x00"
+
+            # Query service types
+            for sname in self.SERVICES_TO_QUERY:
+                header = struct.pack(">HHHHHH", 0x0000, 0x0000, 1, 0, 0, 0)
+                pkt = header + encode_name(sname) + struct.pack(">HH", 12, 1)
+                sock.sendto(pkt, ("224.0.0.251", 5353))
+
+            start = time.monotonic()
+            while time.monotonic() - start < timeout:
+                try:
+                    data, addr = sock.recvfrom(4096)
+                    ip = addr[0]
+                    if ip not in devices:
+                        devices[ip] = {"hostname": None, "services": set()}
+                    if len(data) >= 12:
+                        qd, an, ns, ar = struct.unpack(">HHHH", data[4:12])
+                        offset = 12
+                        for _ in range(qd):
+                            _, offset = self._decode_name(data, offset)
+                            offset += 4
+                        for _ in range(an + ns + ar):
+                            if offset >= len(data): break
+                            name, offset = self._decode_name(data, offset)
+                            if offset + 10 > len(data): break
+                            rtype, rclass, ttl, rdlen = struct.unpack(">HHIH", data[offset:offset+10])
+                            offset += 10
+                            if rtype == 12:  # PTR
+                                tgt, _ = self._decode_name(data, offset)
+                                devices[ip]["services"].add(tgt)
+                            elif rtype == 1 and rdlen == 4:  # A
+                                devices[ip]["hostname"] = name
+                            elif rtype == 33 and rdlen >= 6:  # SRV
+                                tgt, _ = self._decode_name(data, offset + 6)
+                                devices[ip]["hostname"] = tgt
+                            offset += rdlen
+                except socket.timeout:
+                    continue
+                except Exception:
+                    break
+            sock.close()
+        except Exception:
+            pass
+
+        results = []
+        for ip, info in devices.items():
+            results.append(MdnsDevice(
+                timestamp=ts,
+                ip_address=ip,
+                hostname=info["hostname"],
+                services=list(info["services"]),
+                last_seen=ts,
+            ))
+        return results
+
+
+# ---------------------------------------------------------------------------
+# LAN Neighbor / ARP Scanner
+# ---------------------------------------------------------------------------
+
+class LanNeighborProbe:
+    """Discovers active local devices via ARP cache with MAC vendor resolution."""
+
+    OUI_VENDORS = {
+        "b8:27:eb": "Raspberry Pi", "dc:a6:32": "Raspberry Pi", "e4:5f:01": "Raspberry Pi",
+        "cc:28:aa": "Ubiquiti / UniFi", "0a:28:aa": "Ubiquiti / UniFi", "74:83:c2": "Ubiquiti / UniFi",
+        "00:15:5d": "Microsoft Hyper-V", "00:50:56": "VMware", "00:0c:29": "VMware",
+        "00:0e:58": "Sonifex", "f0:18:98": "Apple", "3c:22:fb": "Apple", "ac:bc:32": "Apple",
+        "00:1a:11": "Google", "b8:e8:56": "Google", "a4:77:33": "Google",
+        "44:65:0d": "Amazon", "00:fc:8b": "Amazon", "50:c7:bf": "TP-Link", "c0:06:c3": "TP-Link",
+        "e8:48:b8": "Samsung", "28:6c:07": "Xiaomi", "00:11:32": "Synology",
+    }
+
+    def scan(self, gateway_ip: Optional[str] = None) -> list[LanDevice]:
+        """device_type is 'gateway' for gateway_ip, else the ARP type (dynamic/static)."""
+        try:
+            out = cmd_logger.check_output(["arp", "-a"], text=True, errors="ignore")
+        except Exception:
+            return []
+
+        devices = []
+        ts = datetime.now().isoformat()
+        current_iface = "auto"
+
+        for line in out.splitlines():
+            s = line.strip()
+            if not s: continue
+            if "Interface:" in s:
+                parts = s.split()
+                if len(parts) >= 2:
+                    current_iface = parts[1]
+                continue
+            m = re.search(r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F-]+)\s+(\w+)", s)
+            if m:
+                ip = m.group(1)
+                raw_mac = m.group(2).lower().replace("-", ":")
+                ctype = m.group(3).lower()
+                if ip.startswith("224.") or ip.startswith("239.") or ip.endswith(".255"):
+                    continue
+                prefix = ":".join(raw_mac.split(":")[:3])
+                vendor = self.OUI_VENDORS.get(prefix, "Generic / Other")
+                devices.append(LanDevice(
+                    timestamp=ts,
+                    ip_address=ip,
+                    mac_address=raw_mac,
+                    vendor=vendor,
+                    interface_ip=current_iface,
+                    device_type="gateway" if ip == gateway_ip else ctype,
+                    last_seen=ts,
+                ))
+        return devices
+
+
+# ---------------------------------------------------------------------------
+# Path MTU & Fragmentation Probe
+# ---------------------------------------------------------------------------
+
+class PathMtuProbe:
+    """Discovers optimal Path MTU and tests for packet fragmentation."""
+
+    SIZES = [1472, 1464, 1452, 1420, 1372]
+
+    def run(self, target: str = "1.1.1.1") -> MtuSample:
+        ts = datetime.now().isoformat()
+        max_payload = None
+
+        for size in self.SIZES:
+            try:
+                res = cmd_logger.run(
+                    ["ping", "-f", "-l", str(size), "-n", "1", "-w", "1000", target],
+                    capture_output=True, timeout=3,
+                )
+                out = res.stdout.decode("utf-8", errors="ignore")
+                if "fragmented" in out.lower() or "fragmentation" in out.lower():
+                    continue
+                if "Reply from" in out and "bytes=" in out:
+                    max_payload = size
+                    break
+            except Exception:
+                continue
+
+        if max_payload is not None:
+            path_mtu = max_payload + 28  # 20 IP + 8 ICMP
+            status = "optimal" if path_mtu == 1500 else "reduced"
+            notes = "Standard Ethernet MTU (1500)" if path_mtu == 1500 else f"Reduced MTU ({path_mtu}), likely PPPoE or VPN"
+            return MtuSample(
+                timestamp=ts, target_host=target, max_unfragmented_payload=max_payload,
+                path_mtu=path_mtu, status=status, notes=notes,
+            )
+        return MtuSample(
+            timestamp=ts, target_host=target, max_unfragmented_payload=None,
+            path_mtu=None, status="unknown", notes="Could not determine MTU (ICMP blocked)",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gateway Port Health Probe
+# ---------------------------------------------------------------------------
+
+class GatewayPortProbe:
+    """Checks reachability of common gateway services (DNS, Web Admin)."""
+
+    @staticmethod
+    def check_ports(gateway_ip: str) -> dict[int, bool]:
+        results = {}
+        for port in (53, 80, 443, 8080):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(0.3)
+                r = s.connect_ex((gateway_ip, port))
+                s.close()
+                results[port] = (r == 0)
+            except Exception:
+                results[port] = False
+        return results
+
 # ---------------------------------------------------------------------------
 # Storage
 # ---------------------------------------------------------------------------
 
 class Storage:
-    """SQLite persistence for all tables.
+    """Thread-safe SQLite persistence for all tables.
 
-    _apply_schema() runs schema.sql via executescript() on construction.
-    check_same_thread=False allows the web dashboard to open a second
-    read-only connection to the same file concurrently.
+    Uses a threading.Lock to serialize transactions, enables WAL mode for
+    high-concurrency read/write, and applies busy timeouts.
     """
 
     def __init__(self, db_path: str):
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._path = db_path
-        self.connection = sqlite3.connect(db_path, check_same_thread=False)
-        self._apply_schema()
+        self._lock = threading.Lock()
+        self.connection = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
+        with self._lock:
+            self.connection.execute("PRAGMA journal_mode = WAL;")
+            self.connection.execute("PRAGMA busy_timeout = 5000;")
+            self._apply_schema()
 
     def _apply_schema(self):
         with open(SCHEMA_FILE, "r", encoding="utf-8") as fh:
@@ -1195,12 +1608,7 @@ class Storage:
             return 0
 
     def purge_old_rows(self, retention_days: int):
-        """Delete rows older than retention_days from all tables.
-
-        Uses a single cutoff timestamp computed once and applied to every
-        table. Commits once after all deletes to keep the operation atomic.
-        Called from the retention thread once per hour.
-        """
+        """Delete rows older than retention_days from all tables."""
         cutoff = (datetime.now() - timedelta(days=retention_days)).isoformat()
         tables = [
             ("samples",             "timestamp"),
@@ -1211,99 +1619,201 @@ class Storage:
             ("wifi_scan_results",   "scan_timestamp"),
             ("bufferbloat_samples", "timestamp"),
             ("speed_test_results",  "timestamp"),
+            ("action_queue",        "timestamp"),
+            ("process_samples",     "timestamp"),
+            ("dns_benchmarks",      "timestamp"),
+            ("mdns_devices",        "last_seen"),
+            ("lan_devices",         "last_seen"),
+            ("mtu_samples",         "timestamp"),
         ]
-        for table, col in tables:
-            self.connection.execute(
-                f"DELETE FROM {table} WHERE {col} < ?", (cutoff,)
-            )
-        self.connection.commit()
+        with self._lock:
+            for table, col in tables:
+                self.connection.execute(
+                    f"DELETE FROM {table} WHERE {col} < ?", (cutoff,)
+                )
+            self.connection.commit()
 
     def insert_sample(self, s: Sample):
-        self.connection.execute("""
-            INSERT INTO samples
-                (timestamp, probed_host, internet_ping, gateway_ping,
-                 dns_ms, dns_server_ms, http_ms, packet_loss_rate,
-                 ip_address, dns_server, cpu_pct, ram_pct,
-                 probe_duration_ms, notes)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (s.timestamp, s.probed_host, s.internet_ping, s.gateway_ping,
-              s.dns_ms, s.dns_server_ms, s.http_ms, s.packet_loss_rate,
-              s.ip_address, s.dns_server, s.cpu_pct, s.ram_pct,
-              s.probe_duration_ms, s.notes))
-        self.connection.commit()
+        with self._lock:
+            self.connection.execute("""
+                INSERT INTO samples
+                    (timestamp, probed_host, internet_ping, gateway_ping,
+                     dns_ms, dns_server_ms, http_ms, packet_loss_rate,
+                     ip_address, dns_server, cpu_pct, ram_pct,
+                     probe_duration_ms, notes)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (s.timestamp, s.probed_host, s.internet_ping, s.gateway_ping,
+                  s.dns_ms, s.dns_server_ms, s.http_ms, s.packet_loss_rate,
+                  s.ip_address, s.dns_server, s.cpu_pct, s.ram_pct,
+                  s.probe_duration_ms, s.notes))
+            self.connection.commit()
 
     def insert_event(self, timestamp: str, category: str, message: str):
-        self.connection.execute(
-            "INSERT INTO events (timestamp, category, message) VALUES (?,?,?)",
-            (timestamp, category, message),
-        )
-        self.connection.commit()
+        with self._lock:
+            self.connection.execute(
+                "INSERT INTO events (timestamp, category, message) VALUES (?,?,?)",
+                (timestamp, category, message),
+            )
+            self.connection.commit()
 
     def insert_wifi(self, w: WifiSample):
-        self.connection.execute("""
-            INSERT INTO wifi_samples
-                (timestamp, ssid, bssid, signal_pct, channel, band,
-                 rx_rate_mbps, tx_rate_mbps, auth)
-            VALUES (?,?,?,?,?,?,?,?,?)
-        """, (w.timestamp, w.ssid, w.bssid, w.signal_pct, w.channel,
-              w.band, w.rx_rate_mbps, w.tx_rate_mbps, w.auth))
-        self.connection.commit()
+        with self._lock:
+            self.connection.execute("""
+                INSERT INTO wifi_samples
+                    (timestamp, ssid, bssid, signal_pct, channel, band,
+                     rx_rate_mbps, tx_rate_mbps, auth)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (w.timestamp, w.ssid, w.bssid, w.signal_pct, w.channel,
+                  w.band, w.rx_rate_mbps, w.tx_rate_mbps, w.auth))
+            self.connection.commit()
 
     def insert_nic(self, n: NicSample):
-        self.connection.execute("""
-            INSERT INTO nic_samples
-                (timestamp, interface, bytes_sent_ps, bytes_recv_ps,
-                 errin_ps, errout_ps, dropin_ps, dropout_ps)
-            VALUES (?,?,?,?,?,?,?,?)
-        """, (n.timestamp, n.interface, n.bytes_sent_ps, n.bytes_recv_ps,
-              n.errin_ps, n.errout_ps, n.dropin_ps, n.dropout_ps))
-        self.connection.commit()
+        with self._lock:
+            self.connection.execute("""
+                INSERT INTO nic_samples
+                    (timestamp, interface, bytes_sent_ps, bytes_recv_ps,
+                     errin_ps, errout_ps, dropin_ps, dropout_ps)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (n.timestamp, n.interface, n.bytes_sent_ps, n.bytes_recv_ps,
+                  n.errin_ps, n.errout_ps, n.dropin_ps, n.dropout_ps))
+            self.connection.commit()
 
     def insert_tcp(self, t: TcpStateSample):
-        self.connection.execute("""
-            INSERT INTO tcp_states
-                (timestamp, established, time_wait, close_wait, syn_sent,
-                 syn_recv, fin_wait1, fin_wait2, closing, last_ack, listen, other)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (t.timestamp, t.established, t.time_wait, t.close_wait,
-              t.syn_sent, t.syn_recv, t.fin_wait1, t.fin_wait2,
-              t.closing, t.last_ack, t.listen, t.other))
-        self.connection.commit()
+        with self._lock:
+            self.connection.execute("""
+                INSERT INTO tcp_states
+                    (timestamp, established, time_wait, close_wait, syn_sent,
+                     syn_recv, fin_wait1, fin_wait2, closing, last_ack, listen, other)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (t.timestamp, t.established, t.time_wait, t.close_wait,
+                  t.syn_sent, t.syn_recv, t.fin_wait1, t.fin_wait2,
+                  t.closing, t.last_ack, t.listen, t.other))
+            self.connection.commit()
 
     def insert_wifi_scan(self, entries: list[WifiScanEntry]):
-        """Persist all entries from one scan batch. Single commit for the batch."""
-        self.connection.executemany("""
-            INSERT INTO wifi_scan_results
-                (scan_timestamp, ssid, bssid, signal_pct, channel, band,
-                 authentication, cipher)
-            VALUES (?,?,?,?,?,?,?,?)
-        """, [
-            (e.scan_timestamp, e.ssid, e.bssid, e.signal_pct, e.channel,
-             e.band, e.authentication, e.cipher)
-            for e in entries
-        ])
-        self.connection.commit()
+        with self._lock:
+            self.connection.executemany("""
+                INSERT INTO wifi_scan_results
+                    (scan_timestamp, ssid, bssid, signal_pct, channel, band,
+                     authentication, cipher)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, [
+                (e.scan_timestamp, e.ssid, e.bssid, e.signal_pct, e.channel,
+                 e.band, e.authentication, e.cipher)
+                for e in entries
+            ])
+            self.connection.commit()
 
     def insert_bufferbloat(self, b: BufferbloatSample):
-        self.connection.execute("""
-            INSERT INTO bufferbloat_samples
-                (timestamp, baseline_ms, loaded_ms, delta_ms, rating,
-                 download_mbps, ping_host, download_url)
-            VALUES (?,?,?,?,?,?,?,?)
-        """, (b.timestamp, b.baseline_ms, b.loaded_ms, b.delta_ms,
-              b.rating, b.download_mbps, b.ping_host, b.download_url))
-        self.connection.commit()
+        with self._lock:
+            self.connection.execute("""
+                INSERT INTO bufferbloat_samples
+                    (timestamp, baseline_ms, loaded_ms, delta_ms, rating,
+                     download_mbps, ping_host, download_url)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (b.timestamp, b.baseline_ms, b.loaded_ms, b.delta_ms,
+                  b.rating, b.download_mbps, b.ping_host, b.download_url))
+            self.connection.commit()
 
     def insert_speed_test(self, s: SpeedTestSample):
-        self.connection.execute("""
-            INSERT INTO speed_test_results
-                (timestamp, download_mbps, upload_mbps, download_bytes,
-                 upload_bytes, duration_seconds, download_url, upload_url)
-            VALUES (?,?,?,?,?,?,?,?)
-        """, (s.timestamp, s.download_mbps, s.upload_mbps,
-              s.download_bytes, s.upload_bytes, s.duration_seconds,
-              s.download_url, s.upload_url))
-        self.connection.commit()
+        with self._lock:
+            self.connection.execute("""
+                INSERT INTO speed_test_results
+                    (timestamp, download_mbps, upload_mbps, download_bytes,
+                     upload_bytes, duration_seconds, download_url, upload_url)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (s.timestamp, s.download_mbps, s.upload_mbps,
+                  s.download_bytes, s.upload_bytes, s.duration_seconds,
+                  s.download_url, s.upload_url))
+            self.connection.commit()
+
+    def insert_process_samples(self, samples: list[ProcessSample]):
+        with self._lock:
+            self.connection.executemany("""
+                INSERT INTO process_samples
+                    (timestamp, pid, name, conn_count, read_bytes_ps, write_bytes_ps)
+                VALUES (?,?,?,?,?,?)
+            """, [
+                (s.timestamp, s.pid, s.name, s.conn_count, s.read_bytes_ps, s.write_bytes_ps)
+                for s in samples
+            ])
+            self.connection.commit()
+
+    def insert_dns_benchmark(self, b: DnsBenchmarkSample):
+        with self._lock:
+            self.connection.execute("""
+                INSERT INTO dns_benchmarks
+                    (timestamp, local_ms, cloudflare_ms, google_ms, quad9_ms, fastest)
+                VALUES (?,?,?,?,?,?)
+            """, (b.timestamp, b.local_ms, b.cloudflare_ms, b.google_ms, b.quad9_ms, b.fastest))
+            self.connection.commit()
+
+    def poll_pending_action(self) -> Optional[dict]:
+        with self._lock:
+            cur = self.connection.execute(
+                "SELECT id, action, payload FROM action_queue WHERE status = 'pending' ORDER BY id ASC LIMIT 1"
+            )
+            row = cur.fetchone()
+            if row:
+                self.connection.execute(
+                    "UPDATE action_queue SET status = 'running' WHERE id = ?", (row[0],)
+                )
+                self.connection.commit()
+                return {"id": row[0], "action": row[1], "payload": row[2]}
+            return None
+
+    def close(self):
+        """Close the SQLite connection cleanly."""
+        with self._lock:
+            try:
+                self.connection.close()
+            except Exception:
+                pass
+
+    def update_action(self, action_id: int, status: str, result: Optional[str] = None):
+        with self._lock:
+            self.connection.execute(
+                "UPDATE action_queue SET status = ?, result = ? WHERE id = ?",
+                (status, result, action_id),
+            )
+            self.connection.commit()
+
+    def upsert_mdns_devices(self, devices: list[MdnsDevice]):
+        with self._lock:
+            for d in devices:
+                srv_str = ", ".join(sorted(d.services)) if d.services else ""
+                self.connection.execute("""
+                    INSERT INTO mdns_devices (timestamp, ip_address, hostname, services, last_seen)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(ip_address) DO UPDATE SET
+                        hostname = CASE WHEN excluded.hostname != '' THEN excluded.hostname ELSE mdns_devices.hostname END,
+                        services = CASE WHEN excluded.services != '' THEN excluded.services ELSE mdns_devices.services END,
+                        last_seen = excluded.last_seen
+                """, (d.timestamp, d.ip_address, d.hostname or "", srv_str, d.last_seen))
+            self.connection.commit()
+
+    def upsert_lan_devices(self, devices: list[LanDevice]):
+        with self._lock:
+            for d in devices:
+                self.connection.execute("""
+                    INSERT INTO lan_devices (timestamp, ip_address, mac_address, vendor, interface_ip, device_type, last_seen)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(ip_address) DO UPDATE SET
+                        mac_address = excluded.mac_address,
+                        vendor = excluded.vendor,
+                        interface_ip = excluded.interface_ip,
+                        device_type = excluded.device_type,
+                        last_seen = excluded.last_seen
+                """, (d.timestamp, d.ip_address, d.mac_address, d.vendor, d.interface_ip, d.device_type, d.last_seen))
+            self.connection.commit()
+
+    def insert_mtu_sample(self, m: MtuSample):
+        with self._lock:
+            self.connection.execute("""
+                INSERT INTO mtu_samples (timestamp, target_host, max_unfragmented_payload, path_mtu, status, notes)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (m.timestamp, m.target_host, m.max_unfragmented_payload, m.path_mtu, m.status, m.notes))
+            self.connection.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -1351,14 +1861,36 @@ class Monitor:
         self._setup_logging()
         self._last_loop_time: Optional[float] = None
 
+        # Background worker pool for non-blocking speed tests, bufferbloat, and tracert
+        self._worker_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="netmon_worker")
+        # Speed test and bufferbloat both saturate the link, so only one may
+        # run at a time. Triggers come from the monitor and TUI threads.
+        self._link_test_lock = threading.Lock()
+        self._link_test_running = False
+        self._tracert_running = False
+        self._last_tracert_time = 0.0
+        self.TRACERT_COOLDOWN_SECONDS = 300  # 5 min cooldown
+
+        # Probes
+        self.proc_probe = ProcessNetProbe()
+        self.dns_benchmark_probe = DnsBenchmarkProbe()
+        self.mdns_probe = MdnsProbe()
+        self.lan_probe = LanNeighborProbe()
+        self.mtu_probe = PathMtuProbe()
+        self.gw_port_probe = GatewayPortProbe()
+        self.latest_mtu: Optional[MtuSample] = None
+        self.latest_gw_ports: dict[int, bool] = {}
+        self.tui_view = "summary"  # summary | lan | procs
+
         # Write startup event after storage is ready.
         self._add_event("system", "monitor_start")
 
     def shutdown(self):
-        """Graceful shutdown -- write stop event before exiting."""
+        """Graceful shutdown -- write stop event and release worker pool."""
         if self.running:
             self.running = False
             self._add_event("system", "monitor_stop")
+            self._worker_pool.shutdown(wait=False)
 
     def _load_config(self) -> dict:
         with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
@@ -1392,8 +1924,7 @@ class Monitor:
     # -----------------------------------------------------------------------
 
     def _ping(self, host: str) -> Optional[float]:
-        """Ping host once (Windows -n 1 -w 1000); return RTT ms or None."""
-        start = time.perf_counter()
+        """Ping host once (Windows -n 1 -w 1000); return actual ICMP RTT ms or None."""
         try:
             result = cmd_logger.run(
                 ["ping", "-n", "1", "-w", "1000", host],
@@ -1401,7 +1932,7 @@ class Monitor:
             )
             if result.returncode != 0:
                 return None
-            return round((time.perf_counter() - start) * 1000, 1)
+            return parse_ping_rtt(result.stdout.decode("utf-8", errors="ignore"))
         except Exception:
             return None
 
@@ -1499,32 +2030,246 @@ class Monitor:
     # Fault diagnostics
     # -----------------------------------------------------------------------
 
-    def _fault_diagnostics(self):
-        """Probe all hosts concurrently and run tracert on fault."""
-        if not self.config["diagnostics"]["traceroute_on_fault"]:
+    def _claim_link_test(self) -> bool:
+        """Mark a link-saturating test as running; False if one already is."""
+        with self._link_test_lock:
+            if self._link_test_running:
+                return False
+            self._link_test_running = True
+            return True
+
+    def _trigger_speed_test(self, action_id: Optional[int] = None):
+        if not self._claim_link_test():
+            if action_id:
+                self.storage.update_action(action_id, "failed", "A speed or bufferbloat test is already in progress")
             return
 
-        all_results = self._ping_all(self.ping_cycler.all())
-        summary = ", ".join(
-            f"{h}={'OK' if ms is not None else 'FAIL'}"
-            for h, ms in all_results.items()
-        )
-        self._add_event("fault", f"multi-host probe: {summary}")
+        def _task():
+            try:
+                self._add_event("system", "speedtest: started background test")
+                sample = self.speed_probe.run()
+                self.storage.insert_speed_test(sample)
+                msg = f"speedtest: dl={sample.download_mbps} Mbps, ul={sample.upload_mbps} Mbps"
+                self._add_event("system", msg)
+                if action_id:
+                    self.storage.update_action(action_id, "completed", msg)
+            except Exception as exc:
+                self._add_event("system", f"speedtest failed: {exc}")
+                if action_id:
+                    self.storage.update_action(action_id, "failed", str(exc))
+            finally:
+                self._link_test_running = False
 
-        primary = self.ping_cycler.all()[0]
-        self._add_event("info", f"Running tracert to {primary}")
-        try:
-            out = cmd_logger.check_output(
-                ["tracert", primary],
-                text=True, encoding="utf-8", errors="ignore", timeout=60,
-            )
-            inc_dir = Path(self.config["storage"]["incidents_path"])
-            inc_dir.mkdir(parents=True, exist_ok=True)
-            fname = inc_dir / f"incident_{int(time.time())}.txt"
-            with open(fname, "w", encoding="utf-8") as fh:
-                fh.write(f"Multi-host probe: {summary}\n\n{out}")
-        except Exception as exc:
-            self._add_event("info", f"tracert failed: {exc}")
+        self._worker_pool.submit(_task)
+
+    def _trigger_bufferbloat(self, action_id: Optional[int] = None):
+        if not self._claim_link_test():
+            if action_id:
+                self.storage.update_action(action_id, "failed", "A speed or bufferbloat test is already in progress")
+            return
+
+        def _task():
+            try:
+                self._add_event("system", "bufferbloat: started background test")
+                sample = self.bloat_probe.run(
+                    ping_host=self.ping_cycler.all()[0],
+                    baseline_ms=self.stats.average(),
+                    ping_fn=self._ping,
+                )
+                self.storage.insert_bufferbloat(sample)
+                msg = (
+                    f"bufferbloat: {sample.rating} "
+                    f"(baseline={sample.baseline_ms} ms, loaded={sample.loaded_ms} ms, "
+                    f"delta={sample.delta_ms} ms, dl={sample.download_mbps} Mbps)"
+                )
+                self._add_event("system", msg)
+                if action_id:
+                    self.storage.update_action(action_id, "completed", msg)
+            except Exception as exc:
+                self._add_event("system", f"bufferbloat failed: {exc}")
+                if action_id:
+                    self.storage.update_action(action_id, "failed", str(exc))
+            finally:
+                self._link_test_running = False
+
+        self._worker_pool.submit(_task)
+
+    def _trigger_wifi_scan(self, action_id: Optional[int] = None):
+        def _task():
+            try:
+                entries = self.wifi_scanner.scan()
+                if entries:
+                    self.storage.insert_wifi_scan(entries)
+                    msg = f"wifi_scan: found {len(entries)} visible networks"
+                    self._add_event("wifi", msg)
+                    if action_id:
+                        self.storage.update_action(action_id, "completed", msg)
+                else:
+                    if action_id:
+                        self.storage.update_action(action_id, "completed", "No networks found")
+            except Exception as exc:
+                if action_id:
+                    self.storage.update_action(action_id, "failed", str(exc))
+
+        self._worker_pool.submit(_task)
+
+    def _trigger_dns_benchmark(self, local_dns: Optional[str], action_id: Optional[int] = None):
+        def _task():
+            try:
+                bench = self.dns_benchmark_probe.run(local_dns)
+                self.storage.insert_dns_benchmark(bench)
+                msg = f"dns_benchmark: fastest={bench.fastest} (CF: {bench.cloudflare_ms}ms, Google: {bench.google_ms}ms, Local: {bench.local_ms}ms)"
+                self._add_event("system", msg)
+                if action_id:
+                    self.storage.update_action(action_id, "completed", msg)
+            except Exception as exc:
+                if action_id:
+                    self.storage.update_action(action_id, "failed", str(exc))
+
+        self._worker_pool.submit(_task)
+
+    def _trigger_manual_traceroute(self, target: str, action_id: Optional[int] = None):
+        def _task():
+            try:
+                self._add_event("info", f"Running manual tracert to {target}")
+                out = cmd_logger.check_output(
+                    ["tracert", target],
+                    text=True, encoding="utf-8", errors="ignore", timeout=60,
+                )
+                inc_dir = Path(self.config["storage"]["incidents_path"])
+                inc_dir.mkdir(parents=True, exist_ok=True)
+                fname = inc_dir / f"incident_{int(time.time())}.txt"
+                with open(fname, "w", encoding="utf-8") as fh:
+                    fh.write(f"Manual traceroute to {target}\n\n{out}")
+                msg = f"traceroute to {target} completed, saved to {fname.name}"
+                self._add_event("info", msg)
+                if action_id:
+                    self.storage.update_action(action_id, "completed", msg)
+            except Exception as exc:
+                self._add_event("info", f"manual tracert failed: {exc}")
+                if action_id:
+                    self.storage.update_action(action_id, "failed", str(exc))
+
+        self._worker_pool.submit(_task)
+
+    def _trigger_lan_scan(self, action_id: Optional[int] = None):
+        def _task():
+            try:
+                devices = self.lan_probe.scan(gateway_ip=self.gw_cache.get())
+                if devices:
+                    self.storage.upsert_lan_devices(devices)
+                msg = f"lanscan: discovered {len(devices)} active LAN neighbor devices"
+                self._add_event("network", msg)
+                if action_id:
+                    self.storage.update_action(action_id, "completed", msg)
+            except Exception as exc:
+                self._add_event("network", f"lanscan failed: {exc}")
+                if action_id:
+                    self.storage.update_action(action_id, "failed", str(exc))
+
+        self._worker_pool.submit(_task)
+
+    def _trigger_mdns_scan(self, action_id: Optional[int] = None):
+        def _task():
+            try:
+                devices = self.mdns_probe.scan(timeout=1.5)
+                if devices:
+                    self.storage.upsert_mdns_devices(devices)
+                msg = f"mdnsscan: discovered {len(devices)} mDNS services"
+                self._add_event("network", msg)
+                if action_id:
+                    self.storage.update_action(action_id, "completed", msg)
+            except Exception as exc:
+                self._add_event("network", f"mdnsscan failed: {exc}")
+                if action_id:
+                    self.storage.update_action(action_id, "failed", str(exc))
+
+        self._worker_pool.submit(_task)
+
+    def _trigger_mtu_scan(self, target: str = "1.1.1.1", action_id: Optional[int] = None):
+        def _task():
+            try:
+                mtu_sample = self.mtu_probe.run(target)
+                self.latest_mtu = mtu_sample
+                self.storage.insert_mtu_sample(mtu_sample)
+                msg = f"mtuscan to {target}: Path MTU {mtu_sample.path_mtu} ({mtu_sample.notes})"
+                self._add_event("network", msg)
+                if action_id:
+                    self.storage.update_action(action_id, "completed", msg)
+            except Exception as exc:
+                self._add_event("network", f"mtuscan failed: {exc}")
+                if action_id:
+                    self.storage.update_action(action_id, "failed", str(exc))
+
+        self._worker_pool.submit(_task)
+
+    def _process_action_queue(self, dns_srv: Optional[str]):
+        item = self.storage.poll_pending_action()
+        if not item:
+            return
+        aid = item["id"]
+        act = item["action"]
+        payload = item.get("payload") or ""
+
+        if act == "speedtest":
+            self._trigger_speed_test(action_id=aid)
+        elif act == "bufferbloat":
+            self._trigger_bufferbloat(action_id=aid)
+        elif act == "wifiscan":
+            self._trigger_wifi_scan(action_id=aid)
+        elif act == "dns_benchmark":
+            self._trigger_dns_benchmark(dns_srv, action_id=aid)
+        elif act == "mdnsscan":
+            self._trigger_mdns_scan(action_id=aid)
+        elif act == "lanscan":
+            self._trigger_lan_scan(action_id=aid)
+        elif act == "mtuscan":
+            target = payload.strip() if payload.strip() else "1.1.1.1"
+            self._trigger_mtu_scan(target, action_id=aid)
+        elif act == "traceroute":
+            target = payload.strip() if payload.strip() else self.ping_cycler.all()[0]
+            self._trigger_manual_traceroute(target, action_id=aid)
+        else:
+            self.storage.update_action(aid, "failed", f"Unknown action: {act}")
+
+    def _fault_diagnostics(self):
+        """Probe all hosts concurrently and run tracert in background on fault."""
+        if not self.config["diagnostics"]["traceroute_on_fault"]:
+            return
+        now = time.monotonic()
+        if self._tracert_running or (now - self._last_tracert_time < self.TRACERT_COOLDOWN_SECONDS):
+            return
+
+        self._tracert_running = True
+        self._last_tracert_time = now
+
+        def _task():
+            try:
+                all_results = self._ping_all(self.ping_cycler.all())
+                summary = ", ".join(
+                    f"{h}={'OK' if ms is not None else 'FAIL'}"
+                    for h, ms in all_results.items()
+                )
+                self._add_event("fault", f"multi-host probe: {summary}")
+
+                primary = self.ping_cycler.all()[0]
+                self._add_event("info", f"Running tracert to {primary}")
+                out = cmd_logger.check_output(
+                    ["tracert", primary],
+                    text=True, encoding="utf-8", errors="ignore", timeout=60,
+                )
+                inc_dir = Path(self.config["storage"]["incidents_path"])
+                inc_dir.mkdir(parents=True, exist_ok=True)
+                fname = inc_dir / f"incident_{int(time.time())}.txt"
+                with open(fname, "w", encoding="utf-8") as fh:
+                    fh.write(f"Multi-host probe: {summary}\n\n{out}")
+                self._add_event("info", f"tracert saved to {fname.name}")
+            except Exception as exc:
+                self._add_event("info", f"tracert failed: {exc}")
+            finally:
+                self._tracert_running = False
+
+        self._worker_pool.submit(_task)
 
     # -----------------------------------------------------------------------
     # Retention thread
@@ -1586,42 +2331,54 @@ class Monitor:
 
             wifi_sample, wifi_events = self.wifi_probe.read()
 
-            # Run the full environment scan on the first cycle and then every
-            # scan_interval_cycles cycles after that. Running on cycle 1 means
-            # the dashboard shows Wi-Fi scan data immediately on startup rather
-            # than waiting up to a minute.
+            # Process any queued on-demand actions from web UI or CLI
+            self._process_action_queue(dns_srv)
+
+            # Feature 3: Sample network-active processes every 2 cycles
+            if self._cycle_count == 1 or self._cycle_count % 2 == 0:
+                try:
+                    proc_samples = self.proc_probe.read(top_n=8)
+                    if proc_samples:
+                        self.storage.insert_process_samples(proc_samples)
+                except Exception:
+                    pass
+
+            # Feature 6: Multi-DNS benchmark every 60 cycles
+            if self._cycle_count > 0 and self._cycle_count % 60 == 0:
+                self._trigger_dns_benchmark(dns_srv)
+
+            # LAN and mDNS discovery: cycle 1 and every 300 cycles (~5 min)
+            if self._cycle_count == 1 or self._cycle_count % 300 == 0:
+                self._trigger_lan_scan()
+                self._trigger_mdns_scan()
+
+            # Path MTU probe: cycle 2 and every 900 cycles (~15 min)
+            if self._cycle_count == 2 or self._cycle_count % 900 == 0:
+                self._trigger_mtu_scan()
+
+            # Gateway port health check every 30 cycles (~30s)
+            if gateway and (self._cycle_count == 1 or self._cycle_count % 30 == 0):
+                self.latest_gw_ports = self.gw_port_probe.check_ports(gateway)
+
+            # Wi-Fi full environment scan
             scan_entries: list[WifiScanEntry] = []
             if self._cycle_count == 1 or self._cycle_count % self._scan_interval == 0:
                 scan_entries = self.wifi_scanner.scan()
 
-            # Run bufferbloat test on its own interval. Skipped on cycle 0
-            # so the rolling baseline has time to populate first. Runs inside
-            # the probe block so probe_duration_ms reflects the ~10 s test cost.
-            # Also skipped if a speed test fires this cycle -- they would
-            # interfere by saturating the link simultaneously.
+            # Trigger scheduled speed tests and bufferbloat in background pool
             speed_test_this_cycle = (
                 self.speed_probe.enabled
                 and self._cycle_count > 0
                 and self._cycle_count % self._speed_interval == 0
             )
+            if speed_test_this_cycle:
+                self._trigger_speed_test()
 
-            bloat_sample: Optional[BufferbloatSample] = None
             if (self.bloat_probe.enabled
                     and self._cycle_count > 0
                     and self._cycle_count % self._bloat_interval == 0
                     and not speed_test_this_cycle):
-                bloat_sample = self.bloat_probe.run(
-                    ping_host=self.ping_cycler.all()[0],
-                    baseline_ms=self.stats.average(),
-                    ping_fn=self._ping,
-                )
-
-            # Run speed test -- download then upload, each for test_duration_seconds.
-            # Total blocking time is ~2 * test_duration_seconds; probe_duration_ms
-            # will show this cost. Runs after bufferbloat to avoid link contention.
-            speed_sample: Optional[SpeedTestSample] = None
-            if speed_test_this_cycle:
-                speed_sample = self.speed_probe.run()
+                self._trigger_bufferbloat()
 
             nic_samples = self.nic_probe.read(elapsed_since_last)
             tcp = read_tcp_states()
@@ -1668,30 +2425,13 @@ class Monitor:
 
             if wifi_sample:
                 self.storage.insert_wifi(wifi_sample)
-                self.current_nic = nic_samples[0] if nic_samples else None
+            if nic_samples:
+                self.current_nic = nic_samples[0]
             for ns in nic_samples:
                 self.storage.insert_nic(ns)
             self.storage.insert_tcp(tcp)
             if scan_entries:
                 self.storage.insert_wifi_scan(scan_entries)
-            if bloat_sample:
-                self.storage.insert_bufferbloat(bloat_sample)
-                self._add_event(
-                    "system",
-                    f"bufferbloat: {bloat_sample.rating} "
-                    f"(baseline={bloat_sample.baseline_ms} ms, "
-                    f"loaded={bloat_sample.loaded_ms} ms, "
-                    f"delta={bloat_sample.delta_ms} ms, "
-                    f"dl={bloat_sample.download_mbps} Mbps)",
-                )
-            if speed_sample:
-                self.storage.insert_speed_test(speed_sample)
-                self._add_event(
-                    "system",
-                    f"speedtest: "
-                    f"dl={speed_sample.download_mbps} Mbps, "
-                    f"ul={speed_sample.upload_mbps} Mbps",
-                )
 
             # Events.
             for ev in wifi_events:
@@ -1747,88 +2487,184 @@ class Monitor:
         return graph
 
     def tui(self, stdscr):
-        """Curses TUI. Redraws at ~10 fps until Q is pressed.
-
-        The render body is wrapped in try/except(curses.error) so that a
-        drawing error (terminal too small, string overflows window) is logged
-        and skipped rather than crashing the monitor silently. stdscr.timeout()
-        replaces time.sleep so getch() is non-blocking with a 100 ms wait.
-        """
+        """Enhanced colorized curses TUI with interactive hotkeys and view switching."""
         curses.curs_set(0)
-        stdscr.timeout(100)  # non-blocking getch; replaces time.sleep(0.1)
+        stdscr.timeout(100)
+
+        # Color initialization
+        has_color = curses.has_colors()
+        if has_color:
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_GREEN, -1)   # OK
+            curses.init_pair(2, curses.COLOR_YELLOW, -1)  # WARN
+            curses.init_pair(3, curses.COLOR_RED, -1)     # ERROR
+            curses.init_pair(4, curses.COLOR_CYAN, -1)    # TITLE
+            curses.init_pair(5, curses.COLOR_MAGENTA, -1) # HIGHLIGHT
+
+        def cp(pair_num):
+            return curses.color_pair(pair_num) if has_color else 0
 
         while self.running:
             try:
                 stdscr.erase()
                 height, width = stdscr.getmaxyx()
-                stdscr.addstr(0, 2, "Network Observability Monitor", curses.A_BOLD)
+
+                # Header bar with view indicator and hotkey hints
+                title = "Network Observability Monitor"
+                stdscr.addstr(0, 2, title, curses.A_BOLD | cp(4))
+                mode_str = f"[{self.tui_view.upper()}] Tab:Views | S:Speed B:Bloat W:WiFi L:LAN M:mDNS Q:Quit"
+                if len(title) + len(mode_str) + 6 < width:
+                    stdscr.addstr(0, width - len(mode_str) - 2, mode_str, cp(5))
 
                 row = 2
-                if self.current:
-                    s = self.current
-                    lines = [
-                        f"Time              : {datetime.now().strftime('%H:%M:%S')}",
-                        f"Host (this cycle) : {s.probed_host}",
-                        f"Internet Ping     : {s.internet_ping} ms",
-                        f"Gateway Ping      : {s.gateway_ping} ms",
-                        f"DNS (resolver)    : {s.dns_ms} ms",
-                        f"DNS (server UDP)  : {s.dns_server_ms} ms  [{s.dns_server or '?'}]",
-                        f"HTTP Response     : {s.http_ms} ms",
-                        f"Avg Ping          : {self.stats.average():.1f} ms",
-                        f"Jitter            : {self.stats.jitter():.1f} ms",
-                        f"Packet Loss       : {s.packet_loss_rate:.1f}%",
-                        f"CPU / RAM         : {s.cpu_pct:.1f}% / {s.ram_pct:.1f}%",
-                        f"Probe Duration    : {s.probe_duration_ms:.0f} ms",
-                        f"IP Address        : {s.ip_address or '?'}",
-                        "",
-                        f"Analysis          : {s.notes or 'healthy'}",
-                    ]
-                    if self.current_wifi:
-                        w = self.current_wifi
-                        lines += [
-                            "",
-                            f"Wi-Fi SSID        : {w.ssid}",
-                            f"BSSID             : {w.bssid}",
-                            f"Signal            : {w.signal_pct}%  "
-                            f"Band: {w.band or '?'}  Ch: {w.channel or '?'}",
-                            f"Rx / Tx           : {w.rx_rate_mbps} / {w.tx_rate_mbps} Mbps",
+
+                if self.tui_view == "lan":
+                    # LAN Devices View
+                    stdscr.addstr(row, 2, "Active LAN Subnet Devices (ARP Neighbors)", curses.A_BOLD | cp(4))
+                    row += 2
+                    stdscr.addstr(row, 2, f"{'IP Address':<18} {'MAC Address':<20} {'Vendor / Manufacturer':<25}", curses.A_UNDERLINE)
+                    row += 1
+                    with self.storage._lock:
+                        cur = self.storage.connection.execute(
+                            "SELECT ip_address, mac_address, vendor FROM lan_devices ORDER BY ip_address ASC LIMIT ?",
+                            (max(5, height - 7),)
+                        )
+                        rows = cur.fetchall()
+                    for ip, mac, vendor in rows:
+                        if row >= height - 3: break
+                        stdscr.addstr(row, 2, f"{ip:<18} {mac:<20} {vendor:<25}"[:width - 4])
+                        row += 1
+                    if not rows:
+                        stdscr.addstr(row, 4, "No LAN devices discovered yet. Press 'L' to scan.", cp(2))
+
+                elif self.tui_view == "procs":
+                    # Top Network Hog Processes View
+                    stdscr.addstr(row, 2, "Top Network-Active Applications (Network Hogs)", curses.A_BOLD | cp(4))
+                    row += 2
+                    stdscr.addstr(row, 2, f"{'Application':<22} {'PID':<8} {'Conns':<8} {'Download Rate':<16} {'Upload Rate':<16}", curses.A_UNDERLINE)
+                    row += 1
+                    with self.storage._lock:
+                        cur = self.storage.connection.execute("""
+                            SELECT name, pid, conn_count, read_bytes_ps, write_bytes_ps
+                            FROM process_samples
+                            WHERE timestamp = (SELECT MAX(timestamp) FROM process_samples)
+                            ORDER BY (read_bytes_ps + write_bytes_ps) DESC, conn_count DESC
+                            LIMIT ?
+                        """, (max(5, height - 7),))
+                        rows = cur.fetchall()
+                    for name, pid, conns, rb, wb in rows:
+                        if row >= height - 3: break
+                        dl_kbs = f"↓ {rb / 1024:.1f} KB/s"
+                        ul_kbs = f"↑ {wb / 1024:.1f} KB/s"
+                        stdscr.addstr(row, 2, f"{name:<22} {pid:<8} {conns:<8} {dl_kbs:<16} {ul_kbs:<16}"[:width - 4])
+                        row += 1
+                    if not rows:
+                        stdscr.addstr(row, 4, "Sampling network processes...", cp(2))
+
+                else:
+                    # Default: Summary Telemetry View
+                    if self.current:
+                        s = self.current
+
+                        def metric_pair(ms, threshold_warn=100, threshold_err=500):
+                            if ms is None: return cp(3)
+                            if ms > threshold_err: return cp(3)
+                            if ms > threshold_warn: return cp(2)
+                            return cp(1)
+
+                        lines = [
+                            ("Time              : " + datetime.now().strftime('%H:%M:%S'), 0),
+                            ("Host (this cycle) : " + s.probed_host, 0),
+                            (f"Internet Ping     : {s.internet_ping} ms", metric_pair(s.internet_ping, 50, 200)),
+                            (f"Gateway Ping      : {s.gateway_ping} ms", metric_pair(s.gateway_ping, 10, 50)),
+                            (f"DNS (resolver)    : {s.dns_ms} ms", metric_pair(s.dns_ms, 50, 200)),
+                            (f"DNS (server UDP)  : {s.dns_server_ms} ms  [{s.dns_server or '?'}]", metric_pair(s.dns_server_ms, 50, 200)),
+                            (f"HTTP Response     : {s.http_ms} ms", metric_pair(s.http_ms, 200, 800)),
+                            (f"Avg Ping          : {self.stats.average():.1f} ms", 0),
+                            (f"Jitter            : {self.stats.jitter():.1f} ms", cp(2) if self.stats.jitter() > 30 else 0),
+                            (f"Packet Loss       : {s.packet_loss_rate:.1f}%", cp(3) if s.packet_loss_rate > 5 else cp(1)),
+                            (f"CPU / RAM         : {s.cpu_pct:.1f}% / {s.ram_pct:.1f}%", 0),
+                            (f"Probe Duration    : {s.probe_duration_ms:.0f} ms", cp(2) if s.probe_duration_ms > 800 else 0),
+                            (f"IP Address        : {s.ip_address or '?'}", 0),
                         ]
 
-                    for line in lines:
-                        if row >= height - 7:
-                            break
-                        stdscr.addstr(row, 2, line[:width - 4])
-                        row += 1
+                        if self.latest_mtu and self.latest_mtu.path_mtu:
+                            lines.append((f"Path MTU          : {self.latest_mtu.path_mtu} ({self.latest_mtu.status.upper()})", cp(1) if self.latest_mtu.path_mtu == 1500 else cp(2)))
 
-                    if row + 3 < height:
-                        stdscr.addstr(row + 1, 2, "Latency Graph")
-                        stdscr.addstr(row + 2, 2, self._graph(width - 4))
-                    if row + 5 < height:
-                        stdscr.addstr(row + 4, 2, "Recent Events", curses.A_BOLD)
-                        er = row + 5
-                        for event in self.events:
-                            if er >= height - 2:
+                        if self.latest_gw_ports:
+                            ports = "  ".join(f"{p}:{'open' if ok else 'closed'}" for p, ok in sorted(self.latest_gw_ports.items()))
+                            lines.append((f"Gateway Ports     : {ports}", 0))
+
+                        lines.append(("", 0))
+                        analysis_color = cp(3) if s.notes else cp(1)
+                        lines.append((f"Analysis          : {s.notes or 'healthy'}", analysis_color))
+
+                        if self.current_wifi:
+                            w = self.current_wifi
+                            lines += [
+                                ("", 0),
+                                (f"Wi-Fi SSID        : {w.ssid}", cp(4)),
+                                (f"BSSID             : {w.bssid}", 0),
+                                (f"Signal            : {w.signal_pct}%  Band: {w.band or '?'}  Ch: {w.channel or '?'}", cp(1) if (w.signal_pct or 0) > 60 else cp(2)),
+                                (f"Rx / Tx           : {w.rx_rate_mbps} / {w.tx_rate_mbps} Mbps", 0),
+                            ]
+
+                        for line, attr in lines:
+                            if row >= height - 7:
                                 break
-                            stdscr.addstr(er, 4, event[:width - 6])
-                            er += 1
-                else:
-                    if height > 4:
-                        stdscr.addstr(2, 2, "Waiting for first sample...")
+                            stdscr.addstr(row, 2, line[:width - 4], attr)
+                            row += 1
 
+                        if row + 3 < height:
+                            stdscr.addstr(row + 1, 2, "Latency Graph (ms)", cp(4))
+                            stdscr.addstr(row + 2, 2, self._graph(width - 4), cp(1))
+                        if row + 5 < height:
+                            stdscr.addstr(row + 4, 2, "Recent Events", curses.A_BOLD | cp(4))
+                            er = row + 5
+                            for event in self.events:
+                                if er >= height - 2:
+                                    break
+                                color = cp(3) if "fault" in event or "packet_loss" in event else (cp(2) if "wifi" in event else 0)
+                                stdscr.addstr(er, 4, event[:width - 6], color)
+                                er += 1
+                    else:
+                        if height > 4:
+                            stdscr.addstr(2, 2, "Waiting for first sample...", cp(2))
+
+                # Footer
                 if height > 1:
-                    stdscr.addstr(height - 1, 2, "Press Q to quit")
+                    footer = "Press [Tab] to cycle view | [S] Speedtest | [B] Bufferbloat | [W] WiFi Scan | [L] LAN Scan | [M] mDNS | [Q] Quit"
+                    stdscr.addstr(height - 1, 2, footer[:width - 4], curses.A_DIM)
+
                 stdscr.refresh()
 
             except curses.error as exc:
-                # Almost always "addstr() returned ERR" when the terminal is
-                # too small. Log at DEBUG and continue; the next cycle will
-                # try again after the user resizes.
                 log.debug("TUI render error: %s", exc)
 
             key = stdscr.getch()
             if key in (ord("q"), ord("Q")):
                 self.shutdown()
                 break
+            elif key in (ord("s"), ord("S")):
+                self._trigger_speed_test()
+                self._add_event("system", "TUI: speedtest triggered")
+            elif key in (ord("b"), ord("B")):
+                self._trigger_bufferbloat()
+                self._add_event("system", "TUI: bufferbloat test triggered")
+            elif key in (ord("w"), ord("W")):
+                self._trigger_wifi_scan()
+                self._add_event("wifi", "TUI: wifi scan triggered")
+            elif key in (ord("l"), ord("L")):
+                self._trigger_lan_scan()
+                self._add_event("network", "TUI: LAN ARP scan triggered")
+            elif key in (ord("m"), ord("M")):
+                self._trigger_mdns_scan()
+                self._add_event("network", "TUI: mDNS scan triggered")
+            elif key in (ord("	"), 9):
+                views = ["summary", "lan", "procs"]
+                idx = (views.index(self.tui_view) + 1) % len(views)
+                self.tui_view = views[idx]
 
 
 # ---------------------------------------------------------------------------
@@ -1845,6 +2681,18 @@ def main():
     parser.add_argument(
         "--headless", action="store_true",
         help="Run without the curses TUI (pair with web_dashboard.py)",
+    )
+    parser.add_argument(
+        "--web", action="store_true",
+        help="Run the web dashboard inside this process in a background thread",
+    )
+    parser.add_argument(
+        "--port", type=int, default=5000,
+        help="Port for the web dashboard (default: 5000, used with --web)",
+    )
+    parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="Host for the web dashboard (default: 127.0.0.1, used with --web)",
     )
     parser.add_argument(
         "--debug", action="store_true",
@@ -1888,6 +2736,19 @@ def main():
 
     retention = threading.Thread(target=monitor.retention_loop, daemon=True)
     retention.start()
+
+    if args.web:
+        import web_dashboard
+        web_dashboard.DB_PATH = monitor.storage._path
+        web_dashboard.INCIDENTS_PATH = monitor.config["storage"]["incidents_path"]
+        logging.getLogger("werkzeug").setLevel(logging.WARNING)
+        web_thread = threading.Thread(
+            target=web_dashboard.app.run,
+            kwargs={"host": args.host, "port": args.port, "debug": False, "use_reloader": False},
+            daemon=True,
+        )
+        web_thread.start()
+        print(f"Web Dashboard started at http://{args.host}:{args.port}")
 
     if args.headless:
         print("Running in headless mode. Press Ctrl+C to stop.")
